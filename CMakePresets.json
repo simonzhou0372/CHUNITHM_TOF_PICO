@@ -1,0 +1,35 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "pico",
+            "displayName": "Raspberry Pi Pico",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            },
+            "environment": {
+                "PICO_SDK_PATH": "$env{USERPROFILE}/.pico-sdk/sdk/2.3.0"
+            }
+        },
+        {
+            "name": "pico-debug",
+            "displayName": "Raspberry Pi Pico (Debug)",
+            "inherits": "pico",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "pico",
+            "configurePreset": "pico"
+        },
+        {
+            "name": "pico-debug",
+            "configurePreset": "pico-debug"
+        }
+    ]
+}
