@@ -379,6 +379,7 @@ int main(void) {
         uint32_t now = to_ms_since_boot(get_absolute_time());
         gpio_put(LED_PIN, (now / 500) % 2);
 
+        /*
         // 调试输出：每 100ms 打印一次（减少阻塞）
         static uint32_t last_debug = 0;
         if (now - last_debug >= 100) {
@@ -390,6 +391,7 @@ int main(void) {
                    vl53l0x_get_error_count(0), vl53l0x_get_error_count(1), vl53l0x_get_error_count(2),
                    vl53l0x_get_error_count(3), vl53l0x_get_error_count(4));
         }
+                   */
     }
 
     return 0;
