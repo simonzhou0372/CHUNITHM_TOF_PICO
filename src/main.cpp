@@ -296,7 +296,7 @@ static void cdc_process_command(const char* cmd) {
             if (num_args >= 5 && air6_range >= pitch && air6_range <= 200) {
                 cfg->air6_range = air6_range;
             }
-            // Min hold time (可选，默认 50)
+            // Min hold time (可选，默认 100)
             if (num_args >= 6 && min_hold >= 10 && min_hold <= 500) {
                 cfg->air_min_hold_ms = min_hold;
             }
@@ -314,19 +314,24 @@ static void cdc_process_command(const char* cmd) {
                cfg->tof_offset, cfg->tof_pitch, cfg->air6_range, cfg->air_min_hold_ms);
     }
     else if (strcmp(cmd, "SAVE") == 0) {
-        config_save();
-        printf("OK Config saved\r\n");
+        if (config_save()) {
+            printf("SAVE OK\r\n");
+        } else {
+            printf("SAVE ERROR\r\n");
+        }
     }
     else if (strcmp(cmd, "DEFAULT") == 0) {
-        // Reset to default values
+        // Reset to default values (does NOT save to Flash)
+        // To persist defaults, user must call SAVE after DEFAULT
         cfg->touch_threshold = 20;
         cfg->release_threshold = 18;
         cfg->tof_offset = 120;
-        cfg->tof_pitch = 40;
+        cfg->tof_pitch = 30;
         cfg->air6_range = 150;
-        cfg->air_min_hold_ms = 50;
+        cfg->air_min_hold_ms = 100;
         mpr121_set_thresholds(20, 18);
-        printf("OK Defaults restored (touch=20 release=18 offset=120 pitch=40 air6=150 hold=50)\r\n");
+        printf("DEFAULT OK touch=20 release=18 offset=120 pitch=30 air6=150 hold=100\r\n");
+        printf("NOTE: Defaults applied to RAM. Use SAVE to persist to Flash.\r\n");
     }
     else if (strcmp(cmd, "STATUS") == 0) {
         // 增强的 STATUS 输出

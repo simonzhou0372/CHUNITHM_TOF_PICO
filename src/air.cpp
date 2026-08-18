@@ -54,11 +54,11 @@ void air_init() {
 
 void air_update() {
     // Get config parameters (in mm)
-    // Default: offset=120mm, pitch=40mm, air6_range=150mm
+    // Default: offset=120mm, pitch=30mm, air6_range=150mm
     uint16_t offset_mm = cfg ? cfg->tof_offset : 120;
-    uint16_t pitch_mm = cfg ? cfg->tof_pitch : 40;
+    uint16_t pitch_mm = cfg ? cfg->tof_pitch : 30;
     uint16_t air6_range_mm = cfg ? cfg->air6_range : 150;
-    uint16_t min_hold_ms = cfg ? cfg->air_min_hold_ms : 50;
+    uint16_t min_hold_ms = cfg ? cfg->air_min_hold_ms : 100;
 
     // ===== 收集传感器数据并计算最大值 =====
     uint16_t max_value = 0;

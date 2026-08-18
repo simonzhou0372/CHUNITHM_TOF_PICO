@@ -25,10 +25,10 @@ typedef struct {
     uint8_t release_threshold;
 
     // TOF Air 检测参数 (单位: mm)
-    uint8_t tof_offset;  // 起始高度, 默认 60mm
+    uint8_t tof_offset;  // 起始高度, 默认 120mm
     uint8_t tof_pitch;   // 每段高度 (Air1-5), 默认 30mm
     uint8_t air6_range;  // Air6 检测范围, 默认 150mm (>= pitch)
-    uint16_t air_min_hold_ms;  // AIR 最小按下持续时间, 默认 50ms (修正为 uint16_t)
+    uint16_t air_min_hold_ms;  // AIR 最小按下持续时间, 默认 100ms (修正为 uint16_t)
 
     // 保留原有阈值配置 (兼容性)
     uint16_t air_threshold[5];
@@ -43,7 +43,7 @@ extern config_t* cfg;
 
 // Configuration functions
 void config_init();
-void config_save();
+bool config_save();  // 返回 true 表示保存成功, false 表示失败
 void config_reset();
 
 } // namespace Chuni245Tof
