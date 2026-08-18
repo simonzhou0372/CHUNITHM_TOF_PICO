@@ -189,9 +189,9 @@ if (max_value >= offset_mm && max_value <= offset_mm + pitch_mm) {
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | offset | 120mm | Air 起始高度 |
-| pitch | 40mm | 每级高度 |
+| pitch | 30mm | 每级高度 |
 | air6_range | 150mm | Air6 检测范围 |
-| min_hold | 50ms | 最小按下时间 |
+| min_hold | 100ms | 最小按下时间 |
 
 **配置建议**：
 - Offset ≥ 100mm（避免 Air1 误触）
@@ -207,7 +207,7 @@ static uint32_t air_press_time[6] = {0};
 
 void air_update() {
     uint32_t now = to_ms_since_boot(get_absolute_time());
-    uint16_t min_hold_ms = 50;
+    uint16_t min_hold_ms = 100;
     
     for (int i = 0; i < 6; i++) {
         bool sensor_on = (sensor_bitmap >> i) & 1;
