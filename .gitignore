@@ -4,4 +4,6 @@ build
 *.exe
 *.zip
 tools/__pycache__
+tools/dist
+tools/build
 release
