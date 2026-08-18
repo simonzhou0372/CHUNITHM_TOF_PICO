@@ -57,6 +57,11 @@ static volatile uint32_t main_loop_max_us = 0;
 static volatile uint32_t main_loop_avg_us = 0;
 static volatile uint64_t main_loop_last_time = 0;
 
+// 监控模式
+static volatile bool monitor_mode = false;
+static volatile uint32_t monitor_interval_ms = 100;
+static volatile uint64_t last_monitor_time = 0;
+
 static char cdc_rx_buf[256];
 static uint8_t cdc_rx_pos = 0;
 
@@ -216,6 +221,54 @@ static void report_usb_hid() {
         }
     }
     // 如果状态未变化且没有 dirty，不发送（节省带宽）
+}
+
+// 输出监控数据（JSON格式，包含所有关键信息）
+static void output_monitor_data() {
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+
+    // 获取AIR调试数据
+    air_debug_data_t air_debug = air_get_debug_data();
+
+    // 获取Slider状态
+    uint32_t slider_state = slider_get_state();
+
+    // 一次性输出所有关键数据（减少通信次数）
+    printf("{\r\n");
+    printf("  \"t\": %lu,\r\n", now);
+
+    // Slider状态（32 bits）
+    printf("  \"slider\": %lu,\r\n", slider_state);
+
+    // AIR 状态
+    printf("  \"air\": {\r\n");
+    printf("    \"max\": %d,\r\n", air_debug.max_distance);
+    printf("    \"sensor\": %u,\r\n", air_debug.sensor_bitmap);
+    printf("    \"hid\": %u\r\n", air_debug.hid_bitmap);
+    printf("  },\r\n");
+
+    // TOF 传感器数据
+    printf("  \"tof\": [\r\n");
+    for (int i = 0; i < 5; i++) {
+        printf("    {\"d\": %d, \"a\": %lu, \"v\": %d}%s\r\n",
+               air_debug.sensor_distances[i],
+               air_debug.sensor_ages[i],
+               air_debug.sensor_valid[i] ? 1 : 0,
+               (i < 4) ? "," : "");
+    }
+    printf("  ],\r\n");
+
+    // 性能数据
+    printf("  \"perf\": {\r\n");
+    printf("    \"loop_avg\": %lu,\r\n", main_loop_avg_us);
+    printf("    \"loop_max\": %lu,\r\n", main_loop_max_us);
+    printf("    \"hid_sends\": %lu,\r\n", hid_send_count);
+    printf("    \"tof_new\": %lu,\r\n", tof_reader_get_new_data_count());
+    printf("    \"tof_poll_avg\": %lu,\r\n", tof_reader_get_avg_poll_interval_us());
+    printf("    \"tof_poll_max\": %lu\r\n", tof_reader_get_max_poll_interval_us());
+    printf("  }\r\n");
+    printf("}\r\n");
+    printf("---\r\n");  // 分隔符，方便解析
 }
 
 // CDC command handler
@@ -401,9 +454,34 @@ static void cdc_process_command(const char* cmd) {
         printf("  STATUS\r\n");
         printf("  AIRDEBUG\r\n");
         printf("  PERF\r\n");
+        printf("  START_MONITOR <interval_ms>\r\n");
+        printf("  STOP_MONITOR\r\n");
         printf("  SLIDER, MPR, DEBUG, RESET\r\n");
         printf("  DIST, AIR, I2CSCAN\r\n");
         printf("  BOOTLOADER, HELP\r\n");
+    }
+    else if (strncmp(cmd, "START_MONITOR", 13) == 0) {
+        // 解析参数: START_MONITOR <interval_ms>
+        int interval = 100;
+        int num_args = sscanf(cmd + 13, "%d", &interval);
+
+        if (num_args >= 1) {
+            // 限制范围: 50-5000ms
+            if (interval < 50) interval = 50;
+            if (interval > 5000) interval = 5000;
+
+            monitor_interval_ms = interval;
+            monitor_mode = true;
+            last_monitor_time = time_us_64();
+
+            printf("OK Monitor started (interval=%d ms)\r\n", monitor_interval_ms);
+        } else {
+            printf("ERROR Usage: START_MONITOR <interval_ms>\r\n");
+        }
+    }
+    else if (strcmp(cmd, "STOP_MONITOR") == 0) {
+        monitor_mode = false;
+        printf("OK Monitor stopped\r\n");
     }
 }
 
@@ -491,6 +569,17 @@ int main(void) {
         }
         // 滑动平均
         main_loop_avg_us = (main_loop_avg_us * 9 + loop_duration) / 10;
+
+        // 监控模式：定期输出数据
+        if (monitor_mode) {
+            uint64_t now = time_us_64();
+            uint32_t elapsed_ms = (now - last_monitor_time) / 1000;
+
+            if (elapsed_ms >= monitor_interval_ms) {
+                output_monitor_data();
+                last_monitor_time = now;
+            }
+        }
 
         // LED shows activity
         uint32_t now = to_ms_since_boot(get_absolute_time());
