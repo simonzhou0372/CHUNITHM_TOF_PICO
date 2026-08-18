@@ -54,7 +54,7 @@ class ConfigApp:
 
         # TOF visualization parameters
         self.tof_offset = 120
-        self.tof_pitch = 40
+        self.tof_pitch = 30
         self.air6_range = 150
 
         # Canvas drawing items - created once, updated with coords
@@ -120,7 +120,7 @@ class ConfigApp:
         ttk.Label(tof_frame, text="mm", width=4).grid(row=0, column=2)
 
         ttk.Label(tof_frame, text="Pitch:").grid(row=1, column=0, sticky='w')
-        self.tof_pitch_var = tk.StringVar(value="40")
+        self.tof_pitch_var = tk.StringVar(value="30")
         ttk.Entry(tof_frame, textvariable=self.tof_pitch_var, width=5).grid(row=1, column=1, padx=2)
         ttk.Label(tof_frame, text="mm", width=4).grid(row=1, column=2)
 
@@ -130,7 +130,7 @@ class ConfigApp:
         ttk.Label(tof_frame, text="mm", width=4).grid(row=2, column=2)
 
         ttk.Label(tof_frame, text="Min Hold:").grid(row=3, column=0, sticky='w')
-        self.air_hold_var = tk.StringVar(value="50")
+        self.air_hold_var = tk.StringVar(value="100")
         ttk.Entry(tof_frame, textvariable=self.air_hold_var, width=5).grid(row=3, column=1, padx=2)
         ttk.Label(tof_frame, text="ms", width=4).grid(row=3, column=2)
 
@@ -572,19 +572,37 @@ class ConfigApp:
 
     def save_config(self):
         if messagebox.askyesno("Confirm", "Save to flash?"):
-            self.send_cmd("SAVE")
+            response = self.send_cmd("SAVE")
+            # Check response
+            if "SAVE OK" in response:
+                self.log("✓ Config saved to flash successfully")
+                messagebox.showinfo("Success", "Configuration saved to flash!")
+            elif "SAVE ERROR" in response:
+                self.log("✗ ERROR: Failed to save config to flash")
+                messagebox.showerror("Error", "Failed to save configuration to flash!\n\nCheck device logs for details.")
+            else:
+                self.log(f"✗ Unexpected response: {response}")
+                messagebox.showwarning("Warning", f"Unexpected response from device:\n{response}")
             self.update_tof_ranges()
 
     def restore_defaults(self):
-        if messagebox.askyesno("Confirm", "Restore defaults?"):
-            self.send_cmd("DEFAULT")
-            self.touch_thr_var.set("20")
-            self.release_thr_var.set("18")
-            self.tof_offset_var.set("120")
-            self.tof_pitch_var.set("40")
-            self.air6_range_var.set("150")
-            self.air_hold_var.set("50")
-            self.update_tof_ranges()
+        if messagebox.askyesno("Restore Defaults",
+                                "Restore default configuration?\n\n"
+                                "This will reset RAM to defaults.\n"
+                                "To save defaults to flash, click 'Save to Flash' afterwards."):
+            response = self.send_cmd("DEFAULT")
+            if "DEFAULT OK" in response:
+                self.touch_thr_var.set("20")
+                self.release_thr_var.set("18")
+                self.tof_offset_var.set("120")
+                self.tof_pitch_var.set("30")
+                self.air6_range_var.set("150")
+                self.air_hold_var.set("100")
+                self.update_tof_ranges()
+                self.log("✓ Defaults restored to RAM")
+                self.log("NOTE: Use 'Save to Flash' to persist defaults")
+            else:
+                self.log(f"✗ ERROR: Failed to restore defaults: {response}")
 
     def toggle_monitoring(self):
         if self.monitoring:
