@@ -1,6 +1,11 @@
 /*
  * Chuni245Tof Main Program
  * NKRO Keyboard with MPR121 Slider + VL53L0X Air
+ *
+ * 改进：
+ * 1. 优化 HID 发送机制 - 使用 dirty flag，状态变化立即发送
+ * 2. 修复 CONFIG 命令 - 支持 min_hold 参数
+ * 3. 添加性能统计和 AIR 调试命令
  */
 
 #include <stdlib.h>
@@ -40,6 +45,17 @@ struct __attribute__((packed)) {
     uint8_t modifier;
     uint8_t keymap[15];
 } hid_nkro, sent_hid_nkro;
+
+// HID 状态管理
+static volatile bool hid_dirty = false;  // 状态变化标志
+static volatile uint64_t last_hid_send_time = 0;  // 上次发送时间
+static volatile uint32_t hid_send_count = 0;  // HID 发送计数
+
+// 性能统计
+static volatile uint32_t main_loop_count = 0;
+static volatile uint32_t main_loop_max_us = 0;
+static volatile uint32_t main_loop_avg_us = 0;
+static volatile uint64_t main_loop_last_time = 0;
 
 static char cdc_rx_buf[256];
 static uint8_t cdc_rx_pos = 0;
@@ -133,6 +149,12 @@ static void nkro_set_key(uint8_t keycode, bool pressed) {
 
 // Generate NKRO report
 static void gen_nkro_report() {
+    // 保存旧状态
+    uint8_t old_keymap[15];
+    uint8_t old_modifier = hid_nkro.modifier;
+    memcpy(old_keymap, hid_nkro.keymap, sizeof(hid_nkro.keymap));
+
+    // 清空新状态
     memset(&hid_nkro, 0, sizeof(hid_nkro));
 
     // Physical buttons (GP18=ENTER, GP19=2)
@@ -158,33 +180,53 @@ static void gen_nkro_report() {
             nkro_set_key(air_keymap[i], true);
         }
     }
+
+    // 检查状态是否变化
+    if (hid_nkro.modifier != old_modifier ||
+        memcmp(hid_nkro.keymap, old_keymap, sizeof(hid_nkro.keymap)) != 0) {
+        hid_dirty = true;  // 状态变化，需要发送
+    }
 }
 
 // Send HID report
 static void report_usb_hid() {
-    static uint64_t next_nkro_time = 0;
-
+    // 检查 USB 是否就绪
     if (!tud_hid_n_ready(0)) {
-        return;
+        return;  // USB 未就绪，不发送，但保持 dirty 标志
     }
 
-    if ((memcmp(&hid_nkro, &sent_hid_nkro, sizeof(hid_nkro)) != 0) ||
-        (time_us_64() > next_nkro_time)) {
+    // 检查是否有状态变化
+    bool state_changed = (memcmp(&hid_nkro, &sent_hid_nkro, sizeof(hid_nkro)) != 0);
+
+    if (state_changed) {
+        // 状态变化，立即发送
         if (tud_hid_n_report(0, 0, &hid_nkro, sizeof(hid_nkro))) {
             sent_hid_nkro = hid_nkro;
-            next_nkro_time = time_us_64() + 4000;
+            hid_dirty = false;
+            last_hid_send_time = time_us_64();
+            hid_send_count++;
+        }
+    } else if (hid_dirty) {
+        // 之前因 USB busy 延迟发送，现在重试
+        if (tud_hid_n_report(0, 0, &hid_nkro, sizeof(hid_nkro))) {
+            sent_hid_nkro = hid_nkro;
+            hid_dirty = false;
+            last_hid_send_time = time_us_64();
+            hid_send_count++;
         }
     }
+    // 如果状态未变化且没有 dirty，不发送（节省带宽）
 }
 
 // CDC command handler
 static void cdc_process_command(const char* cmd) {
-    // Parse CONFIG command: CONFIG touch release offset pitch air6_range
+    // Parse CONFIG command: CONFIG touch release offset pitch air6_range min_hold
     if (strncmp(cmd, "CONFIG ", 7) == 0) {
         int touch, release, offset, pitch, air6_range, min_hold;
-        int num_args = sscanf(cmd + 7, "%d %d %d %d %d %d", &touch, &release, &offset, &pitch, &air6_range);
+        int num_args = sscanf(cmd + 7, "%d %d %d %d %d %d",
+                             &touch, &release, &offset, &pitch, &air6_range, &min_hold);
 
-        if (num_args >= 4) {  // 至少 4 �?参数
+        if (num_args >= 4) {  // 至少 4 个参数
             // Validate ranges
             if (touch >= 5 && touch <= 30 && release >= 1 && release <= 25) {
                 cfg->touch_threshold = touch;
@@ -197,25 +239,26 @@ static void cdc_process_command(const char* cmd) {
             if (pitch >= 4 && pitch <= 100) {
                 cfg->tof_pitch = pitch;
             }
-            // Air6 range (�?选，默�?? 80)
+            // Air6 range (可选，默认 150)
             if (num_args >= 5 && air6_range >= pitch && air6_range <= 200) {
                 cfg->air6_range = air6_range;
-            } else if (num_args < 5) {
-                // 如果�?提供，使用默认�?
-                air6_range = cfg->air6_range;
+            }
+            // Min hold time (可选，默认 50)
+            if (num_args >= 6 && min_hold >= 10 && min_hold <= 500) {
+                cfg->air_min_hold_ms = min_hold;
             }
 
-            printf("OK touch=%d release=%d offset=%d pitch=%d air6=%d\r\n",
+            printf("OK touch=%d release=%d offset=%d pitch=%d air6=%d hold=%d\r\n",
                    cfg->touch_threshold, cfg->release_threshold,
-                   cfg->tof_offset, cfg->tof_pitch, cfg->air6_range);
+                   cfg->tof_offset, cfg->tof_pitch, cfg->air6_range, cfg->air_min_hold_ms);
         } else {
-            printf("ERROR Usage: CONFIG touch release offset pitch [air6_range]\r\n");
+            printf("ERROR Usage: CONFIG touch release offset pitch [air6_range] [min_hold]\r\n");
         }
     }
     else if (strcmp(cmd, "CONFIG?") == 0) {
-        printf("CONFIG touch=%d release=%d offset=%d pitch=%d air6=%d\r\n",
+        printf("CONFIG touch=%d release=%d offset=%d pitch=%d air6=%d hold=%d\r\n",
                cfg->touch_threshold, cfg->release_threshold,
-               cfg->tof_offset, cfg->tof_pitch, cfg->air6_range);
+               cfg->tof_offset, cfg->tof_pitch, cfg->air6_range, cfg->air_min_hold_ms);
     }
     else if (strcmp(cmd, "SAVE") == 0) {
         config_save();
@@ -233,11 +276,62 @@ static void cdc_process_command(const char* cmd) {
         printf("OK Defaults restored (touch=20 release=18 offset=120 pitch=40 air6=150 hold=50)\r\n");
     }
     else if (strcmp(cmd, "STATUS") == 0) {
-        printf("{\"slider\":0x%08lX,\"air\":0x%02X,\"i2c_err\":{\"mpr\":[%lu,%lu,%lu],\"tof\":[%lu,%lu,%lu,%lu,%lu]}}\r\n",
-               slider_get_state(), air_get_bitmap(),
-               mpr121_get_error_count(0), mpr121_get_error_count(1), mpr121_get_error_count(2),
+        // 增强的 STATUS 输出
+        printf("{\r\n");
+        printf("  \"slider\": \"0x%08lX\",\r\n", slider_get_state());
+        printf("  \"air\": \"0x%02X\",\r\n", air_get_bitmap());
+        printf("  \"perf\": {\r\n");
+        printf("    \"loop_avg_us\": %lu,\r\n", main_loop_avg_us);
+        printf("    \"loop_max_us\": %lu,\r\n", main_loop_max_us);
+        printf("    \"hid_sends\": %lu,\r\n", hid_send_count);
+        printf("    \"tof_new_data\": %lu,\r\n", tof_reader_get_new_data_count());
+        printf("    \"tof_poll_avg_us\": %lu,\r\n", tof_reader_get_avg_poll_interval_us());
+        printf("    \"tof_poll_max_us\": %lu\r\n", tof_reader_get_max_poll_interval_us());
+        printf("  },\r\n");
+        printf("  \"i2c_err\": {\r\n");
+        printf("    \"mpr\": [%lu, %lu, %lu],\r\n",
+               mpr121_get_error_count(0), mpr121_get_error_count(1), mpr121_get_error_count(2));
+        printf("    \"tof\": [%lu, %lu, %lu, %lu, %lu]\r\n",
                vl53l0x_get_error_count(0), vl53l0x_get_error_count(1), vl53l0x_get_error_count(2),
                vl53l0x_get_error_count(3), vl53l0x_get_error_count(4));
+        printf("  }\r\n");
+        printf("}\r\n");
+    }
+    else if (strcmp(cmd, "AIRDEBUG") == 0) {
+        // 输出 AIR 调试数据
+        air_debug_data_t debug = air_get_debug_data();
+        printf("AIR Debug:\r\n");
+        printf("  max_dist: %d mm\r\n", debug.max_distance);
+        printf("  sensor_bmp: 0x%02X (", debug.sensor_bitmap);
+        for (int i = 0; i < 6; i++) {
+            printf("%d", (debug.sensor_bitmap >> i) & 1);
+        }
+        printf(")\r\n");
+        printf("  hid_bmp: 0x%02X (", debug.hid_bitmap);
+        for (int i = 0; i < 6; i++) {
+            printf("%d", (debug.hid_bitmap >> i) & 1);
+        }
+        printf(")\r\n");
+        printf("  sensors:\r\n");
+        for (int i = 0; i < 5; i++) {
+            printf("    TOF%d: dist=%d mm, age=%lu ms, valid=%d\r\n",
+                   i + 1, debug.sensor_distances[i],
+                   debug.sensor_ages[i], debug.sensor_valid[i]);
+        }
+    }
+    else if (strcmp(cmd, "PERF") == 0) {
+        // 输出性能统计
+        printf("Performance Statistics:\r\n");
+        printf("  Main loop:\r\n");
+        printf("    avg: %lu us\r\n", main_loop_avg_us);
+        printf("    max: %lu us\r\n", main_loop_max_us);
+        printf("    count: %lu\r\n", main_loop_count);
+        printf("  HID:\r\n");
+        printf("    sends: %lu\r\n", hid_send_count);
+        printf("  Core1 TOF:\r\n");
+        printf("    new_data: %lu\r\n", tof_reader_get_new_data_count());
+        printf("    poll_avg: %lu us\r\n", tof_reader_get_avg_poll_interval_us());
+        printf("    poll_max: %lu us\r\n", tof_reader_get_max_poll_interval_us());
     }
     else if (strcmp(cmd, "SLIDER") == 0) {
         printf("Raw slider state: 0x%08lX\r\n", slider_get_state());
@@ -299,7 +393,17 @@ static void cdc_process_command(const char* cmd) {
         mpr121_reset_baseline();
     }
     else if (strcmp(cmd, "HELP") == 0) {
-        printf("Commands: CONFIG, CONFIG?, SAVE, DEFAULT, STATUS, SLIDER, MPR, DEBUG, RESET, DIST, AIR, I2CSCAN, BOOTLOADER, HELP\r\n");
+        printf("Commands:\r\n");
+        printf("  CONFIG touch release offset pitch [air6_range] [min_hold]\r\n");
+        printf("  CONFIG?\r\n");
+        printf("  SAVE\r\n");
+        printf("  DEFAULT\r\n");
+        printf("  STATUS\r\n");
+        printf("  AIRDEBUG\r\n");
+        printf("  PERF\r\n");
+        printf("  SLIDER, MPR, DEBUG, RESET\r\n");
+        printf("  DIST, AIR, I2CSCAN\r\n");
+        printf("  BOOTLOADER, HELP\r\n");
     }
 }
 
@@ -338,7 +442,8 @@ int main(void) {
     gpio_pull_up(BUTTON_2_PIN);
 
     printf("\n========================================\n");
-    printf("   Chuni245Tof Controller\n");
+    printf("   Chuni245Tof Controller\r\n");
+    printf("   Optimized for High-Speed Air Detection\r\n");
     printf("========================================\n\n");
 
     tusb_init();
@@ -349,20 +454,21 @@ int main(void) {
     config_init();
     save_init(0xCA34CAFE, &lock);
 
-    printf("Initializing sensors...\n");
+    printf("Initializing sensors...\r\n");
     button_init();
     slider_init();
     vl53l0x_init();  // 先初始化 VL53L0X
     air_init();      // 再启动 Core 1 读取任务
-    printf("Ready.\n\n");
+    printf("Ready.\r\n\n");
 
-    printf("Commands: STATUS, DIST, AIR, I2CSCAN, BOOTLOADER, HELP\n");
-    printf("Send DIST to see TOF readings\n\n");
+    printf("Commands: STATUS, AIRDEBUG, PERF, DIST, AIR, HELP\r\n\n");
 
-    uint32_t last_log = 0;
-    uint32_t last_debug = 0;
+    main_loop_last_time = time_us_64();
 
     while (1) {
+        // 性能统计：记录循环开始时间
+        uint64_t loop_start = time_us_64();
+
         tud_task();
         cdc_task();
 
@@ -375,23 +481,20 @@ int main(void) {
 
         save_loop();
 
+        // 性能统计：计算循环耗时
+        uint64_t loop_end = time_us_64();
+        uint32_t loop_duration = (uint32_t)(loop_end - loop_start);
+
+        main_loop_count++;
+        if (loop_duration > main_loop_max_us) {
+            main_loop_max_us = loop_duration;
+        }
+        // 滑动平均
+        main_loop_avg_us = (main_loop_avg_us * 9 + loop_duration) / 10;
+
         // LED shows activity
         uint32_t now = to_ms_since_boot(get_absolute_time());
         gpio_put(LED_PIN, (now / 500) % 2);
-
-        /*
-        // 调试输出：每 100ms 打印一次（减少阻塞）
-        static uint32_t last_debug = 0;
-        if (now - last_debug >= 100) {
-            last_debug = now;
-            printf("Air=0x%02X Dist=%d | Core1: %lu reads, %lu err | I2C: MPR[%lu,%lu,%lu] TOF[%lu,%lu,%lu,%lu,%lu]\n",
-                   air_get_bitmap(), air_get_distance(0),
-                   tof_reader_get_count(), tof_reader_get_error_count(),
-                   mpr121_get_error_count(0), mpr121_get_error_count(1), mpr121_get_error_count(2),
-                   vl53l0x_get_error_count(0), vl53l0x_get_error_count(1), vl53l0x_get_error_count(2),
-                   vl53l0x_get_error_count(3), vl53l0x_get_error_count(4));
-        }
-                   */
     }
 
     return 0;

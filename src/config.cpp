@@ -17,7 +17,7 @@ static const config_t default_config = {
     .tof_offset = 120,  // Default: 120mm 起始高度
     .tof_pitch = 40,  // Default: 40mm step height for air detection
     .air6_range = 150,  // Default: 150mm range for Air6 (更大的范围)
-    .air_min_hold_ms = 50,  // Default: 50ms 最小按下持续时间
+    .air_min_hold_ms = 50,  // Default: 50ms 最小按下持续时间 (uint16_t)
     .air_threshold = {1500, 1500, 1500, 1500, 1500},
 };
 

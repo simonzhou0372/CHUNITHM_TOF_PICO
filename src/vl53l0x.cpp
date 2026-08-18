@@ -187,51 +187,72 @@ void vl53l0x_stop_ranging(uint8_t index) {
     write_reg(sensor_addr[index], 0x00, 0x01);
 }
 
-uint16_t vl53l0x_read_distance(uint8_t index) {
-    if (index >= 5 || !sensor_ready[index]) return 8190;
+// 读取距离数据（非阻塞）
+// 返回值: true = 成功读取新数据, false = 数据未就绪或读取失败
+// distance: 输出参数，返回距离值(mm)
+// 注意: 只有返回 true 时，distance 才是新测量值，应更新timestamp
+bool vl53l0x_read_distance(uint8_t index, uint16_t *distance) {
+    if (index >= 5 || !sensor_ready[index] || !distance) {
+        return false;
+    }
 
     uint8_t addr = sensor_addr[index];
 
-    // ===== 非阻塞读取策略（稳定性配置） =====
-    // 检查数据是否就绪，如果未就绪，返回上次值（不等待）
-    // 连续模式下，数据会不断更新，下次读取时通常已就绪
-
+    // 检查数据是否就绪
     uint8_t interrupt_status = 0;
     if (!read_reg(addr, 0x13, &interrupt_status)) {
         i2c_error_count[index]++;
-        return distance_mm[index];
+        return false;  // I2C 错误，不更新数据
     }
 
     if ((interrupt_status & 0x07) == 0) {
-        // 数据未就绪，返回上次的值（不阻塞）
-        return distance_mm[index];
+        // 数据未就绪，不更新数据
+        return false;
     }
 
     // 数据已就绪，读取距离值
     uint16_t range = 0;
     if (!read_reg16(addr, 0x1E, &range)) {
         i2c_error_count[index]++;
-        return distance_mm[index];
+        return false;  // I2C 错误，不更新数据
     }
 
     // 清除中断标志
     if (!write_reg(addr, 0x0B, 0x01)) {
         i2c_error_count[index]++;
+        // 即使清除中断失败，数据仍然有效
     }
 
-    // Validate
+    // 验证并更新距离值
     if (range > 0 && range < 8190) {
         distance_mm[index] = range;
+        *distance = range;
+        return true;  // 成功获取新数据
     } else {
         distance_mm[index] = 8190;
+        *distance = 8190;
+        return true;  // 虽然是错误值，但确实是新数据
     }
-
-    return distance_mm[index];
 }
 
-uint16_t vl53l0x_get_distance(uint8_t index) {
+// 获取上一次有效的距离数据（不触发新测量）
+uint16_t vl53l0x_get_last_distance(uint8_t index) {
     if (index < 5) return distance_mm[index];
     return 8190;
+}
+
+// 检查传感器是否有新数据就绪（非阻塞检查）
+bool vl53l0x_has_new_data(uint8_t index) {
+    if (index >= 5 || !sensor_ready[index]) {
+        return false;
+    }
+
+    uint8_t interrupt_status = 0;
+    if (!read_reg(sensor_addr[index], 0x13, &interrupt_status)) {
+        return false;
+    }
+
+    return (interrupt_status & 0x07) != 0;
 }
 
 bool vl53l0x_is_ready(uint8_t index) {
