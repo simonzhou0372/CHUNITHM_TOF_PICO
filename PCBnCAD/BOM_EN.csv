@@ -1,0 +1,9 @@
+Item,Qty,Requirement,Notice
+PICO RP2040 Development Board,1,Solderless,No soldering required for bottom contacts
+MPR121 Proximity Capacitive Touch Sensor Module,3,30.6mm*20.5mm module, solderless Top 5-pin bottom 12-pin
+VL53L0X Time-of-Flight Ranging Module,5,25mm*12mm module with M3 screws, solderless Pin order: VCC GND SCL SDA GPIO1 XSHUT
+6x6 Tactile Push Button Switch,2,Any height
+M3x8 Male-Female Standoff Screw,9
+Pin Headers,As needed
+Acrylic Panel,Custom or DIY cutting,My design fits 24.5-inch screen
+PCB Board,Custom production,My design fits 24.5-inch screen
