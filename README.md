@@ -297,9 +297,9 @@ CONFIG <touch> <release> <offset> <pitch> <air6_range> <min_hold>
   touch      - 触摸阈值 (5-30, 默认 20)
   release    - 释放阈值 (1-25, 默认 18)
   offset     - Air 起始高度 mm (40-200, 默认 120)
-  pitch      - Air 每级高度 mm (4-100, 默认 40)
+  pitch      - Air 每级高度 mm (4-100, 默认 30)
   air6_range - Air6 检测范围 mm (pitch-200, 默认 150)
-  min_hold   - 最小按下时间 ms (10-500, 默认 50)
+  min_hold   - 最小按下时间 ms (10-500, 默认 100)
 ```
 
 ---

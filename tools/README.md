@@ -168,7 +168,7 @@ Performance Statistics:
   - 范围：40-200mm
   - 不建议 < 100mm（会导致 Air1 持续触发）
 
-- **Step Height (pitch)**: 40mm（推荐值）
+- **Step Height (pitch)**: 30mm（推荐值）
   - 范围：4-100mm
   - 不建议 < 30mm（快速抬手可能漏检）
 
