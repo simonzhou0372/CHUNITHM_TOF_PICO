@@ -3,3 +3,4 @@ build
 .claude
 *.exe
 *.zip
+tools/__pycache__
