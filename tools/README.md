@@ -154,14 +154,14 @@ Performance Statistics:
 ## 🎛️ 参数配置建议
 
 ### MPR121 触摸阈值
-- **Touch Threshold**: 20（推荐值）
-  - 范围：5-30
+- **Touch Threshold**: 5（默认值）
+  - 范围：1-255
   - 越低越容易触发
-  
-- **Release Threshold**: 18（推荐值）
-  - 范围：1-25
+
+- **Release Threshold**: 3（默认值）
+  - 范围：1-255
   - 越高越容易释放
-  - 建议 Touch > Release（差值 2）
+  - 建议 Touch > Release（差值 ≥ 2）
 
 ### TOF AIR 设置
 - **Start Height (offset)**: 120mm（推荐值）

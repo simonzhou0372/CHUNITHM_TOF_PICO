@@ -61,13 +61,9 @@ Core 0 (主循环)          Core 1 (TOF 专用)
 
 ## ✨ 特性
 
-- ✅ **完美触摸检测**：经过大量验证的 MPR121 参数，零误触
-- ✅ **6 级空中感应**：VL53L0X 阵列实现高度检测
-- ✅ **双核心架构**：Core 1 专用读取 TOF，主循环零延迟
-- ✅ **NKRO 键盘输出**：无需额外驱动，直接识别
 - ✅ **实时配置**：串口调试工具动态调整参数
 - ✅ **参数持久化**：配置保存到 Flash，重启后保留
-- ✅ **I2C 错误监控**：实时统计通信错误，便于调试
+- [ ] **实验性TOF检测**：待实现，目前还是单纯的区间检测
 
 ---
 
@@ -170,15 +166,18 @@ cell32=0xBC   ; ,
 
 ### 材料清单 (BOM)
 
-| 类别 | 元件 | 型号/规格 | 数量 | 备注 |
-|------|------|----------|------|------|
-| **主控** | MCU | Raspberry Pi Pico | 1 | 或 RP2040 最小系统板 |
-| **触摸** | 电容触摸 IC | MPR121 | 3 | I2C 地址: 0x5A, 0x5B, 0x5C |
-| **测距** | 激光测距 | VL53L0X 模块 | 5 | I2C 地址动态分配 |
-| **连接器** | 排针 | 2.54mm | 若干 | 根据需要 |
-| **PCB** | 主板 | - | 1 | Gerber 文件见 Release |
+| 项目 | 数量 | 要求 | 备注 |
+|------|------|------|------|
+| PICO RP2040 开发板 | 1 | 无焊接 | 反面触点无需焊接 |
+| MPR121 接近电容式触摸传感器模块 | 3 | 30.6mm×20.5mm 模块，无焊接 | 上方 5pin，下方 12pin |
+| VL53L0X 飞行时间测距模块 | 5 | 25mm×12mm 两侧带 M3 螺丝模块，无焊接 | 顺序 VCC GND SCL SDA GPIO1 XSHUT |
+| 6×6 脚立式微动开关 | 2 | 高度随意 | - |
+| M3×8 子母铆钉对接螺丝 | 9 | - | - |
+| 排针 | 若干 | - | - |
+| 亚克力板 | 需定制或自己切割 | - | 适配 24.5 寸屏幕 |
+| PCB 板 | 需定制 | - | 适配 24.5 寸屏幕，Gerber 文件见 Release |
 
-> 📋 完整 BOM 表格见 [GitHub Releases](https://github.com/simonzhou0372/CHUNITHM_TOF_PICO/releases)
+> 📋 完整 BOM 表格见 [GitHub Releases](https://github.com/simonzhou0372/CHUNITHM_TOF_PICO/releases)（提供 `BOM_CN.csv` 与 `BOM_EN.csv` 两个版本）
 
 ### Pin Out
 
@@ -223,11 +222,28 @@ cell32=0xBC   ; ,
 ### 下载
 
 > 📥 固件发布在 [GitHub Releases](https://github.com/simonzhou0372/CHUNITHM_TOF_PICO/releases)，包含：
-> - `Chuni245Tof.uf2` - 固件文件
-> - `gerber_xxx.zip` - PCB 制造文件
-> - `BOM.csv` - 材料清单
-> - `case.dxf` - 外壳图纸
-> - `config_cdc.exe` - 参数配置软件
+>
+> **固件文件**
+> - `Chuni245Tof.uf2` - UF2 格式固件（推荐，拖放烧录）
+> - `Chuni245Tof.bin` - BIN 格式固件
+> - `Chuni245Tof.hex` - HEX 格式固件
+>
+> **PCB 制造文件**
+> - `Gerber_PCB1_2026-08-18.zip` - Gerber 文件，可直接发厂打板
+>
+> **外壳/亚克力板图纸 (DXF)**
+> - `main_toppanel_1mm.dxf` - 顶层面板（1mm）
+> - `main_toppanel_for_art.dxf` - 顶层面板（用于贴图/艺术版）
+> - `main_bottompanel_1mm.dxf` - 底层面板（1mm）
+> - `main_bottom_typec_3mm.dxf` - 底层 Type-C 开口（3mm）
+> - `main_bottom_units_2mm.dxf` - 底层单元（2mm）
+>
+> **配置工具**
+> - `ChunitofPicoConfig.exe` - 参数配置软件（Windows）
+>
+> **材料清单**
+> - `BOM_CN.csv` - 材料清单（中文）
+> - `BOM_EN.csv` - 材料清单（English）
 
 ### 烧录方法
 
@@ -281,7 +297,7 @@ python tools/config_cdc.py
 | 命令 | 功能 | 示例 |
 |------|------|------|
 | `CONFIG?` | 查询当前配置 | `CONFIG?` |
-| `CONFIG` | 设置参数 | `CONFIG 20 18 120 40 150 50` |
+| `CONFIG` | 设置参数 | `CONFIG 5 3 120 40 150 50` |
 | `SAVE` | 保存到 Flash | `SAVE` |
 | `DEFAULT` | 恢复默认值 | `DEFAULT` |
 | `STATUS` | 查询状态 | `STATUS` |
@@ -294,8 +310,8 @@ python tools/config_cdc.py
 CONFIG <touch> <release> <offset> <pitch> <air6_range> <min_hold>
 
 参数:
-  touch      - 触摸阈值 (5-30, 默认 20)
-  release    - 释放阈值 (1-25, 默认 18)
+  touch      - 触摸阈值 (1-255, 默认 5)
+  release    - 释放阈值 (1-255, 默认 3)
   offset     - Air 起始高度 mm (40-200, 默认 120)
   pitch      - Air 每级高度 mm (4-100, 默认 30)
   air6_range - Air6 检测范围 mm (pitch-200, 默认 150)
@@ -318,6 +334,7 @@ CONFIG <touch> <release> <offset> <pitch> <air6_range> <min_hold>
 - [ ] **固件功能扩展**
   - [ ] 游戏手柄模式 (HID Gamepad)
   - [ ] 混合模式 (Gamepad + Keyboard)
+  - [ ]  实验性TOF检测
 
 - [ ] **文档完善**
   - [ ] 焊接教程（照片/视频）
