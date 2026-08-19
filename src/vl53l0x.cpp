@@ -26,9 +26,9 @@ static uint16_t distance_mm[5] = {0, 0, 0, 0, 0};
 static uint8_t stop_variable[5] = {0};
 static uint32_t i2c_error_count[5] = {0, 0, 0, 0, 0};  // I2C 错误计数
 
-// I2C timeout - 稳定性优先
-// 稳定性 > 延迟 >> 精度
-#define I2C_TIMEOUT_US 20000  // 20ms，确保稳定通信
+// I2C timeout - 平衡稳定性和延迟
+// 降低 timeout 以减少异常情况下的阻塞时间
+#define I2C_TIMEOUT_US 5000  // 5ms，从 20ms 降低
 
 // Write register
 static bool write_reg(uint8_t addr, uint8_t reg, uint8_t value) {

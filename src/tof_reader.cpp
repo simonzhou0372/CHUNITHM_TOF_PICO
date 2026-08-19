@@ -56,7 +56,7 @@ static sensor_poll_state_t poll_state[5] = {0};
 
 // VL53L0X 测量周期（约 20ms）
 #define VL53L0X_MEASUREMENT_PERIOD_US  20000
-#define VL53L0X_MIN_POLL_INTERVAL_US   2000  // 最小轮询间隔 2ms
+#define VL53L0X_MIN_POLL_INTERVAL_US   300  // 最小轮询间隔 300us（从 2ms 降低）
 
 // ===== Core 1 主循环 =====
 static void core1_main() {
@@ -88,22 +88,21 @@ static void core1_main() {
 
         // 遍历所有传感器
         for (int i = 0; i < 5; i++) {
-            // 检查是否应该轮询这个传感器
-            // 策略：
-            // 1. 如果距离预计下次就绪时间很近（< 2ms），立即检查
-            // 2. 否则如果距离上次检查已经超过最小轮询间隔，也检查
-            // 3. 最多每 2ms 检查一次，避免过度 polling
+            // 优化后的轮询策略：
+            // 1. 如果接近预计就绪时间（< 2ms），高频检查（每 200us）
+            // 2. 否则每 300us 检查一次
+            // 3. 确保不错过数据就绪窗口
 
             int32_t time_to_next_ready = (int32_t)(poll_state[i].next_ready_time_us - loop_now_us);
             int32_t time_since_last_check = (int32_t)(loop_now_us - poll_state[i].last_check_time_us);
 
             bool should_check = false;
 
-            if (time_to_next_ready <= 2000 && time_since_last_check >= 500) {
-                // 接近预计就绪时间，每 500us 检查一次
+            if (time_to_next_ready <= 2000 && time_since_last_check >= 150) {
+                // 接近预计就绪时间（< 2ms），高频检查（每 150us）
                 should_check = true;
             } else if (time_since_last_check >= VL53L0X_MIN_POLL_INTERVAL_US) {
-                // 超过最小轮询间隔，检查一下
+                // 超过最小轮询间隔（300us），检查
                 should_check = true;
             }
 
@@ -160,9 +159,26 @@ static void core1_main() {
         // 滑动平均计算
         avg_poll_interval_us = (avg_poll_interval_us * 9 + loop_duration) / 10;
 
-        // 短暂休眠，避免过度占用 CPU
-        // 但不要休眠太久，以免错过数据就绪
-        sleep_us(500);  // 500us
+        // 动态休眠策略：
+        // - 找出最近一个传感器预计就绪的时间
+        // - 如果有传感器即将就绪（< 1ms），不休眠或只休眠极短时间
+        // - 否则休眠最多 200us（从固定的 500us 降低）
+
+        uint32_t min_time_to_ready = 0xFFFFFFFF;
+        for (int i = 0; i < 5; i++) {
+            int32_t ttr = (int32_t)(poll_state[i].next_ready_time_us - loop_end_time);
+            if (ttr > 0 && ttr < (int32_t)min_time_to_ready) {
+                min_time_to_ready = ttr;
+            }
+        }
+
+        if (min_time_to_ready <= 800) {
+            // 有传感器即将就绪（< 800us），不休眠或只休眠极短时间
+            sleep_us(50);  // 只休眠 50us
+        } else {
+            // 休眠一小段时间，但最多 200us
+            sleep_us(200);
+        }
     }
 
     core1_running = false;
