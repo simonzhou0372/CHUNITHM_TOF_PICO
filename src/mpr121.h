@@ -8,6 +8,38 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/*
+ * ===== MPR121 Debug System =====
+ *
+ * Set DEBUG_MPR121 to 0 to completely disable all debug code (zero overhead).
+ * When enabled, the debug system adds:
+ *   - One-shot CONFIG dump after init (thresholds, CONFIG1/2, ECR, filter params)
+ *   - TOUCH/RELEASE event logging (only on state transitions)
+ *   - Periodic statistics table (filtered/baseline/delta min/max per electrode)
+ *
+ * Register layout (packed, per MPR121 datasheet):
+ *   Filtered: 0x04 + ch*2   (ELE0-ELE11 readable, no overlap)
+ *   Baseline: 0x1E + ch*2   (ELE0-ELE5 readable; ELE6+ addresses overlap
+ *                             with filter config registers 0x2A-0x35)
+ *
+ * Delta formula:
+ *   delta = (int16_t)(filtered & 0x0FFF) - (int16_t)(baseline & 0x03FF)
+ *   Negative delta means filtered < baseline (touch direction).
+ *
+ * I2C overhead is minimized by:
+ *   - Cycling reads: one (dev,ch) pair per N loop iterations (not all at once)
+ *   - Event reads: only triggered on state transitions
+ *   - Stats print: rate-limited to MPR121_DEBUG_STAT_INTERVAL_MS
+ */
+#define DEBUG_MPR121                    1   /* 0 = disable, 1 = enable           */
+#define MPR121_DEBUG_FIRST_ELECTRODE    0   /* first electrode to monitor (0-5)  */
+#define MPR121_DEBUG_LAST_ELECTRODE     5   /* last  electrode to monitor (0-5)  */
+                                            /* NOTE: E6+ baseline is unreadable  */
+                                            /* (overlaps with filter config)     */
+#define MPR121_DEBUG_STAT_INTERVAL_MS 1000  /* statistics table print interval   */
+#define MPR121_DEBUG_SAMPLE_DIVIDER      5  /* read debug data every Nth loop    */
+                                            /* iteration (1 = every loop)        */
+
 namespace Chuni245Tof {
 
 void mpr121_init();
@@ -18,6 +50,22 @@ bool mpr121_is_touched(uint8_t device, uint8_t channel);
 void mpr121_debug_print();  // 打印 Baseline/FilteredData/Delta 调试信息
 void mpr121_reset_baseline();  // 重置所有通道的 Baseline
 uint32_t mpr121_get_error_count(uint8_t device);  // 获取 I2C 错误计数
+
+#if DEBUG_MPR121
+/*
+ * Call once after mpr121_init() completes.
+ * Prints the [MPR121 CONFIG] table: CONFIG1, CONFIG2, ECR, DEBOUNCE,
+ * filter parameters, and per-electrode touch/release thresholds.
+ */
+void mpr121_debug_init();
+
+/*
+ * Call every main loop iteration (after slider_update / mpr121_update).
+ * Handles event detection, cycling I2C reads, and periodic stats output.
+ * Returns immediately if not enough loop iterations have passed (divider).
+ */
+void mpr121_debug_tick();
+#endif
 
 } // namespace Chuni245Tof
 

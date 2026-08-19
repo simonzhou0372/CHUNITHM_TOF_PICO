@@ -22,8 +22,8 @@ namespace Chuni245Tof {
 // Default configuration - Keyboard mode only
 static const config_t default_config = {
     .hid_mode = HID_MODE_KEYBOARD_ONLY,  // Default: Keyboard only
-    .touch_threshold = 20,                // 高阈值，稳定
-    .release_threshold = 18,              // 高阈值，小迟滞区
+    .touch_threshold = 5,                 // 低阈值，高灵敏度
+    .release_threshold = 3,               // 低阈值，小迟滞区
     .tof_offset = 120,                    // Default: 120mm 起始高度
     .tof_pitch = 30,                      // Default: 30mm step height for air detection
     .air6_range = 150,                    // Default: 150mm range for Air6 (更大的范围)
@@ -58,15 +58,17 @@ static bool validate_config(config_t* cfg) {
         modified = true;
     }
 
-    // MPR121 阈值范围: touch 5-30, release 1-25
-    if (cfg->touch_threshold < 5 || cfg->touch_threshold > 30) {
-        printf("CONFIG VALIDATE: touch_threshold %d -> %d (out of range 5-30)\r\n",
+    // MPR121 阈值范围: 已解除限制，允许调试
+    // touch_threshold 和 release_threshold 的合理范围需要用户自行把握
+    // 注意：touch_threshold 必须大于 release_threshold（迟滞区）
+    if (cfg->touch_threshold < 1 || cfg->touch_threshold > 255) {
+        printf("CONFIG VALIDATE: touch_threshold %d -> %d (out of range 1-255)\r\n",
                cfg->touch_threshold, default_config.touch_threshold);
         cfg->touch_threshold = default_config.touch_threshold;
         modified = true;
     }
-    if (cfg->release_threshold < 1 || cfg->release_threshold > 25) {
-        printf("CONFIG VALIDATE: release_threshold %d -> %d (out of range 1-25)\r\n",
+    if (cfg->release_threshold < 1 || cfg->release_threshold > 255) {
+        printf("CONFIG VALIDATE: release_threshold %d -> %d (out of range 1-255)\r\n",
                cfg->release_threshold, default_config.release_threshold);
         cfg->release_threshold = default_config.release_threshold;
         modified = true;

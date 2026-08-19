@@ -280,12 +280,17 @@ static void cdc_process_command(const char* cmd) {
                              &touch, &release, &offset, &pitch, &air6_range, &min_hold);
 
         if (num_args >= 4) {  // 至少 4 个参数
-            // Validate ranges
-            if (touch >= 5 && touch <= 30 && release >= 1 && release <= 25) {
+            // 阈值范围已解除限制，允许调试
+            // 注意：touch_threshold 必须大于 release_threshold（迟滞区）
+            // 如果违反，mpr121_set_thresholds() 会自动修正并更新 cfg
+            if (touch >= 1 && touch <= 255) {
                 cfg->touch_threshold = touch;
-                cfg->release_threshold = release;
-                mpr121_set_thresholds(touch, release);
             }
+            if (release >= 1 && release <= 255) {
+                cfg->release_threshold = release;
+            }
+            // 立即应用阈值到 MPR121
+            mpr121_set_thresholds(cfg->touch_threshold, cfg->release_threshold);
             if (offset >= 40 && offset <= 200) {
                 cfg->tof_offset = offset;
             }
@@ -323,14 +328,14 @@ static void cdc_process_command(const char* cmd) {
     else if (strcmp(cmd, "DEFAULT") == 0) {
         // Reset to default values (does NOT save to Flash)
         // To persist defaults, user must call SAVE after DEFAULT
-        cfg->touch_threshold = 20;
-        cfg->release_threshold = 18;
+        cfg->touch_threshold = 5;
+        cfg->release_threshold = 3;
         cfg->tof_offset = 120;
         cfg->tof_pitch = 30;
         cfg->air6_range = 150;
         cfg->air_min_hold_ms = 100;
-        mpr121_set_thresholds(20, 18);
-        printf("DEFAULT OK touch=20 release=18 offset=120 pitch=30 air6=150 hold=100\r\n");
+        mpr121_set_thresholds(5, 3);
+        printf("DEFAULT OK touch=5 release=3 offset=120 pitch=30 air6=150 hold=100\r\n");
         printf("NOTE: Defaults applied to RAM. Use SAVE to persist to Flash.\r\n");
     }
     else if (strcmp(cmd, "STATUS") == 0) {
@@ -453,6 +458,8 @@ static void cdc_process_command(const char* cmd) {
     else if (strcmp(cmd, "HELP") == 0) {
         printf("Commands:\r\n");
         printf("  CONFIG touch release offset pitch [air6_range] [min_hold]\r\n");
+        printf("    touch/release: 1-255 (no limit for debugging)\r\n");
+        printf("    note: touch must be > release (auto-corrected if not)\r\n");
         printf("  CONFIG?\r\n");
         printf("  SAVE\r\n");
         printf("  DEFAULT\r\n");
@@ -540,6 +547,9 @@ int main(void) {
     printf("Initializing sensors...\r\n");
     button_init();
     slider_init();
+#if DEBUG_MPR121
+    mpr121_debug_init();  // one-shot config dump after MPR121 init
+#endif
     vl53l0x_init();  // 先初始化 VL53L0X
     air_init();      // 再启动 Core 1 读取任务
     printf("Ready.\r\n\n");
@@ -556,6 +566,9 @@ int main(void) {
         cdc_task();
 
         slider_update();
+#if DEBUG_MPR121
+        mpr121_debug_tick();
+#endif
         air_update();
         button_update();
 
