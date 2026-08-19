@@ -120,8 +120,8 @@ class LanguageManager:
                 self.LANG_EN: "Release:"
             },
             'mpr_help': {
-                self.LANG_CN: "⚠️ 触摸 > 释放, 推荐: T=20, R=18",
-                self.LANG_EN: "⚠️ Touch > Release, Recommend: T=20, R=18"
+                self.LANG_CN: "⚠️ 触摸 > 释放 (范围: 1-255)",
+                self.LANG_EN: "⚠️ Touch > Release (Range: 1-255)"
             },
 
             # TOF 框架
@@ -304,12 +304,12 @@ class LanguageManager:
 
             # 错误消息
             'err_touch_range': {
-                self.LANG_CN: "触摸: 5-30",
-                self.LANG_EN: "Touch: 5-30"
+                self.LANG_CN: "触摸: 1-255",
+                self.LANG_EN: "Touch: 1-255"
             },
             'err_release_range': {
-                self.LANG_CN: "释放: 1-25",
-                self.LANG_EN: "Release: 1-25"
+                self.LANG_CN: "释放: 1-255",
+                self.LANG_EN: "Release: 1-255"
             },
             'err_offset_range': {
                 self.LANG_CN: "偏移: 40-200",
@@ -477,17 +477,23 @@ class ConfigApp:
         touch_label.grid(row=0, column=0, sticky='w')
         self.lang_widgets['touch_label'] = touch_label
 
-        self.touch_thr_var = tk.StringVar(value="20")
-        ttk.Entry(mpr_frame, textvariable=self.touch_thr_var, width=5).grid(row=0, column=1, padx=2)
-        ttk.Label(mpr_frame, text="(5-30)", width=6).grid(row=0, column=2, padx=2)
+        self.touch_thr_var = tk.StringVar(value="5")
+        # Spinbox with up/down arrows (range 1-255, no limit for debugging)
+        self.touch_spinbox = ttk.Spinbox(mpr_frame, from_=1, to=255, textvariable=self.touch_thr_var,
+                                          width=5, wrap=True, increment=1)
+        self.touch_spinbox.grid(row=0, column=1, padx=2)
+        ttk.Label(mpr_frame, text="(1-255)", width=7).grid(row=0, column=2, padx=2)
 
         release_label = ttk.Label(mpr_frame, text=lang_manager.get('release'))
         release_label.grid(row=1, column=0, sticky='w')
         self.lang_widgets['release_label'] = release_label
 
-        self.release_thr_var = tk.StringVar(value="18")
-        ttk.Entry(mpr_frame, textvariable=self.release_thr_var, width=5).grid(row=1, column=1, padx=2)
-        ttk.Label(mpr_frame, text="(1-25)", width=6).grid(row=1, column=2, padx=2)
+        self.release_thr_var = tk.StringVar(value="3")
+        # Spinbox with up/down arrows (range 1-255, no limit for debugging)
+        self.release_spinbox = ttk.Spinbox(mpr_frame, from_=1, to=255, textvariable=self.release_thr_var,
+                                            width=5, wrap=True, increment=1)
+        self.release_spinbox.grid(row=1, column=1, padx=2)
+        ttk.Label(mpr_frame, text="(1-255)", width=7).grid(row=1, column=2, padx=2)
 
         help_text = lang_manager.get('mpr_help')
         self.mpr_help_label = ttk.Label(mpr_frame, text=help_text, foreground='gray', font=('Arial', 7))
@@ -1064,11 +1070,11 @@ class ConfigApp:
             air6_range = int(self.air6_range_var.get())
             air_hold = int(self.air_hold_var.get())
 
-            # Validate
-            if not (5 <= touch <= 30):
+            # Validate (range limits removed for debugging)
+            if not (1 <= touch <= 255):
                 messagebox.showerror("Error", lang_manager.get('err_touch_range'))
                 return
-            if not (1 <= release <= 25):
+            if not (1 <= release <= 255):
                 messagebox.showerror("Error", lang_manager.get('err_release_range'))
                 return
             if not (40 <= offset <= 200):
@@ -1111,8 +1117,8 @@ class ConfigApp:
                                 lang_manager.get('msg_restore_confirm')):
             response = self.send_cmd("DEFAULT")
             if "DEFAULT OK" in response:
-                self.touch_thr_var.set("20")
-                self.release_thr_var.set("18")
+                self.touch_thr_var.set("5")
+                self.release_thr_var.set("3")
                 self.tof_offset_var.set("120")
                 self.tof_pitch_var.set("30")
                 self.air6_range_var.set("150")
@@ -1172,7 +1178,7 @@ class ConfigApp:
                 else:
                     break
             except Exception as e:
-                self.root.after(0, lambda: self.log(f"Monitor error: {e}"))
+                self.root.after(0, lambda err=str(e): self.log(f"Monitor error: {err}"))
                 break
 
     def parse_monitor_data(self, json_str):
