@@ -154,11 +154,11 @@ Performance Statistics:
 ## 🎛️ 参数配置建议
 
 ### MPR121 触摸阈值
-- **Touch Threshold**: 5（默认值）
+- **Touch Threshold**: 10（默认值）
   - 范围：1-255
   - 越低越容易触发
 
-- **Release Threshold**: 3（默认值）
+- **Release Threshold**: 8（默认值）
   - 范围：1-255
   - 越高越容易释放
   - 建议 Touch > Release（差值 ≥ 2）

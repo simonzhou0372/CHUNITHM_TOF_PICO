@@ -297,7 +297,7 @@ python tools/config_cdc.py
 | 命令 | 功能 | 示例 |
 |------|------|------|
 | `CONFIG?` | 查询当前配置 | `CONFIG?` |
-| `CONFIG` | 设置参数 | `CONFIG 5 3 120 40 150 50` |
+| `CONFIG` | 设置参数 | `CONFIG 10 8 120 40 150 50` |
 | `SAVE` | 保存到 Flash | `SAVE` |
 | `DEFAULT` | 恢复默认值 | `DEFAULT` |
 | `STATUS` | 查询状态 | `STATUS` |
@@ -310,8 +310,8 @@ python tools/config_cdc.py
 CONFIG <touch> <release> <offset> <pitch> <air6_range> <min_hold>
 
 参数:
-  touch      - 触摸阈值 (1-255, 默认 5)
-  release    - 释放阈值 (1-255, 默认 3)
+  touch      - 触摸阈值 (1-255, 默认 10)
+  release    - 释放阈值 (1-255, 默认 8)
   offset     - Air 起始高度 mm (40-200, 默认 120)
   pitch      - Air 每级高度 mm (4-100, 默认 30)
   air6_range - Air6 检测范围 mm (pitch-200, 默认 150)
