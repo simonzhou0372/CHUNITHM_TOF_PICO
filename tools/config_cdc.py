@@ -477,7 +477,7 @@ class ConfigApp:
         touch_label.grid(row=0, column=0, sticky='w')
         self.lang_widgets['touch_label'] = touch_label
 
-        self.touch_thr_var = tk.StringVar(value="5")
+        self.touch_thr_var = tk.StringVar(value="10")
         # Spinbox with up/down arrows (range 1-255, no limit for debugging)
         self.touch_spinbox = ttk.Spinbox(mpr_frame, from_=1, to=255, textvariable=self.touch_thr_var,
                                           width=5, wrap=True, increment=1)
@@ -488,7 +488,7 @@ class ConfigApp:
         release_label.grid(row=1, column=0, sticky='w')
         self.lang_widgets['release_label'] = release_label
 
-        self.release_thr_var = tk.StringVar(value="3")
+        self.release_thr_var = tk.StringVar(value="8")
         # Spinbox with up/down arrows (range 1-255, no limit for debugging)
         self.release_spinbox = ttk.Spinbox(mpr_frame, from_=1, to=255, textvariable=self.release_thr_var,
                                             width=5, wrap=True, increment=1)
@@ -1117,8 +1117,8 @@ class ConfigApp:
                                 lang_manager.get('msg_restore_confirm')):
             response = self.send_cmd("DEFAULT")
             if "DEFAULT OK" in response:
-                self.touch_thr_var.set("5")
-                self.release_thr_var.set("3")
+                self.touch_thr_var.set("10")
+                self.release_thr_var.set("8")
                 self.tof_offset_var.set("120")
                 self.tof_pitch_var.set("30")
                 self.air6_range_var.set("150")
