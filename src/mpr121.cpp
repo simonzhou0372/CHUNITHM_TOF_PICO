@@ -161,9 +161,9 @@ static bool mpr_init_single(uint8_t addr, int index) {
     }
 
     // Set touch/release thresholds for all 12 channels
-    // 低阈值 + 小迟滞区 = 高灵敏度
-    uint8_t touch_thr = cfg ? cfg->touch_threshold : 5;
-    uint8_t release_thr = cfg ? cfg->release_threshold : 3;
+    // 使用 mpr121.h 中定义的默认阈值
+    uint8_t touch_thr = cfg ? cfg->touch_threshold : MPR121_DEFAULT_TOUCH_THRESHOLD;
+    uint8_t release_thr = cfg ? cfg->release_threshold : MPR121_DEFAULT_RELEASE_THRESHOLD;
 
     for (int i = 0; i < 12; i++) {
         mpr_write_byte(addr, MPR121_TOUCHTH_L + i * 2, touch_thr);

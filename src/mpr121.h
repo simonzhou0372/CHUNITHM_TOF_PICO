@@ -9,6 +9,38 @@
 #include <stdbool.h>
 
 /*
+ * ===== MPR121 Default Threshold Configuration =====
+ *
+ * 根据实际使用场景选择合适的默认阈值：
+ *
+ * 1. 直接接触模式 (MPR121_TOUCH_BARRIER_MODE = 0)
+ *    - 触点直接接触皮肤或导电材料
+ *    - 高阈值，稳定性好，抗干扰能力强
+ *    - Touch=20, Release=18
+ *
+ * 2. 物体间隔模式 (MPR121_TOUCH_BARRIER_MODE = 1)
+ *    - 触点上有手套、贴纸、塑料片等绝缘材料
+ *    - 低阈值，高灵敏度，更容易触发
+ *    - Touch=10, Release=8
+ *
+ * 使用方法：
+ *   - 修改 MPR121_TOUCH_BARRIER_MODE 定义值
+ *   - 重新编译固件
+ *   - 运行时仍可通过 CONFIG 命令调整
+ */
+#define MPR121_TOUCH_BARRIER_MODE     0    /* 0=直接接触, 1=物体间隔 */
+
+#if MPR121_TOUCH_BARRIER_MODE == 1
+/* 物体间隔模式：低阈值，高灵敏度 */
+#define MPR121_DEFAULT_TOUCH_THRESHOLD    10
+#define MPR121_DEFAULT_RELEASE_THRESHOLD   8
+#else
+/* 直接接触模式：高阈值，稳定可靠（默认） */
+#define MPR121_DEFAULT_TOUCH_THRESHOLD    20
+#define MPR121_DEFAULT_RELEASE_THRESHOLD  18
+#endif
+
+/*
  * ===== MPR121 Debug System =====
  *
  * Set DEBUG_MPR121 to 0 to completely disable all debug code (zero overhead).
@@ -31,7 +63,7 @@
  *   - Event reads: only triggered on state transitions
  *   - Stats print: rate-limited to MPR121_DEBUG_STAT_INTERVAL_MS
  */
-#define DEBUG_MPR121                    1   /* 0 = disable, 1 = enable           */
+#define DEBUG_MPR121                    0   /* 0 = disable, 1 = enable           */
 #define MPR121_DEBUG_FIRST_ELECTRODE    0   /* first electrode to monitor (0-5)  */
 #define MPR121_DEBUG_LAST_ELECTRODE     5   /* last  electrode to monitor (0-5)  */
                                             /* NOTE: E6+ baseline is unreadable  */

@@ -328,14 +328,15 @@ static void cdc_process_command(const char* cmd) {
     else if (strcmp(cmd, "DEFAULT") == 0) {
         // Reset to default values (does NOT save to Flash)
         // To persist defaults, user must call SAVE after DEFAULT
-        cfg->touch_threshold = 5;
-        cfg->release_threshold = 3;
+        cfg->touch_threshold = MPR121_DEFAULT_TOUCH_THRESHOLD;
+        cfg->release_threshold = MPR121_DEFAULT_RELEASE_THRESHOLD;
         cfg->tof_offset = 120;
         cfg->tof_pitch = 30;
         cfg->air6_range = 150;
         cfg->air_min_hold_ms = 100;
-        mpr121_set_thresholds(5, 3);
-        printf("DEFAULT OK touch=5 release=3 offset=120 pitch=30 air6=150 hold=100\r\n");
+        mpr121_set_thresholds(MPR121_DEFAULT_TOUCH_THRESHOLD, MPR121_DEFAULT_RELEASE_THRESHOLD);
+        printf("DEFAULT OK touch=%d release=%d offset=120 pitch=30 air6=150 hold=100\r\n",
+               MPR121_DEFAULT_TOUCH_THRESHOLD, MPR121_DEFAULT_RELEASE_THRESHOLD);
         printf("NOTE: Defaults applied to RAM. Use SAVE to persist to Flash.\r\n");
     }
     else if (strcmp(cmd, "STATUS") == 0) {

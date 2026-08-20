@@ -10,6 +10,7 @@
 
 #include "config.h"
 #include "save.h"
+#include "mpr121.h"  // 引入 MPR121 默认阈值定义
 #include <string.h>
 #include <stdio.h>
 
@@ -22,8 +23,8 @@ namespace Chuni245Tof {
 // Default configuration - Keyboard mode only
 static const config_t default_config = {
     .hid_mode = HID_MODE_KEYBOARD_ONLY,  // Default: Keyboard only
-    .touch_threshold = 5,                 // 低阈值，高灵敏度
-    .release_threshold = 3,               // 低阈值，小迟滞区
+    .touch_threshold = MPR121_DEFAULT_TOUCH_THRESHOLD,      // 由 mpr121.h 定义
+    .release_threshold = MPR121_DEFAULT_RELEASE_THRESHOLD,  // 由 mpr121.h 定义
     .tof_offset = 120,                    // Default: 120mm 起始高度
     .tof_pitch = 30,                      // Default: 30mm step height for air detection
     .air6_range = 150,                    // Default: 150mm range for Air6 (更大的范围)
