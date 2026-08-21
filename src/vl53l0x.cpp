@@ -28,7 +28,7 @@ static uint32_t i2c_error_count[5] = {0, 0, 0, 0, 0};  // I2C 错误计数
 
 // I2C timeout - 平衡稳定性和延迟
 // 降低 timeout 以减少异常情况下的阻塞时间
-#define I2C_TIMEOUT_US 5000  // 5ms，从 20ms 降低
+#define I2C_TIMEOUT_US 3000  // 3ms
 
 // Write register
 static bool write_reg(uint8_t addr, uint8_t reg, uint8_t value) {
@@ -115,14 +115,17 @@ static bool init_sensor(uint8_t index) {
     // 稳定性 > 延迟 >> 精度
 
     // VCSEL pulse periods - 适中的值
-    write_reg(new_addr, 0x27, 0x14);  // PRE_RANGE_VCSEL_PERIOD = 20
-    write_reg(new_addr, 0x29, 0x14);  // FINAL_RANGE_VCSEL_PERIOD = 20
-
+    //write_reg(new_addr, 0x27, 0x14);  // PRE_RANGE_VCSEL_PERIOD = 20
+    //write_reg(new_addr, 0x29, 0x14);  // FINAL_RANGE_VCSEL_PERIOD = 20
+    write_reg(new_addr, 0x27, 0x08);  // PRE_RANGE_VCSEL_PERIOD = 20
+    write_reg(new_addr, 0x29, 0x08);  // FINAL_RANGE_VCSEL_PERIOD = 20
     // 超时设置 - 约 20ms 测量周期
     // 公式：timeout = value * 16 * (2^1.5) μs
     // 0x0100 ≈ 20ms
-    write_reg16(new_addr, 0x28, 0x0100);  // PRE_RANGE_TIMEOUT
-    write_reg16(new_addr, 0x2A, 0x0100);  // FINAL_RANGE_TIMEOUT
+    //write_reg16(new_addr, 0x28, 0x0100);  // PRE_RANGE_TIMEOUT
+    //write_reg16(new_addr, 0x2A, 0x0100);  // FINAL_RANGE_TIMEOUT
+    write_reg16(new_addr, 0x28, 0x0080);  // PRE_RANGE_TIMEOUT
+    write_reg16(new_addr, 0x2A, 0x0080);  // FINAL_RANGE_TIMEOUT
 
     // Signal rate limit - 适中的值（0.25 MCPS）
     write_reg16(new_addr, 0x44, 0x0020);
