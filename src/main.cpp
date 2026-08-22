@@ -224,6 +224,8 @@ static void report_usb_hid() {
 }
 
 // 输出监控数据（JSON格式，包含所有关键信息）
+// 注意：此函数会调用大量printf，只在monitor_mode下按间隔调用
+// 如果CDC TX缓冲区满，printf可能会短暂阻塞
 static void output_monitor_data() {
     uint32_t now = to_ms_since_boot(get_absolute_time());
 
@@ -498,10 +500,17 @@ static void cdc_process_command(const char* cmd) {
     }
 }
 
-// CDC task
+// CDC task - Non-blocking
 static void cdc_task() {
-    while (tud_cdc_available()) {
+    // Limit the number of bytes processed per call to avoid blocking
+    // 如果CDC有大量数据，每轮最多处理64字节
+    const int MAX_CDC_READ_PER_LOOP = 64;
+    int bytes_read = 0;
+
+    while (tud_cdc_available() && bytes_read < MAX_CDC_READ_PER_LOOP) {
         char c = tud_cdc_read_char();
+        bytes_read++;
+
         if (c == '\r' || c == '\n') {
             if (cdc_rx_pos > 0) {
                 cdc_rx_buf[cdc_rx_pos] = '\0';
@@ -559,24 +568,66 @@ int main(void) {
 
     main_loop_last_time = time_us_64();
 
+    /*
+     * ==============================================================================
+     * Core 0 主循环架构
+     * ==============================================================================
+     *
+     * 【实时任务优先级】
+     * ⭐⭐⭐⭐⭐  TinyUSB tud_task()    - USB协议栈，必须持续运行
+     * ⭐⭐⭐⭐⭐  USB HID              - 必须持续发送，不能长时间阻塞
+     * ⭐⭐⭐⭐⭐  MPR121 Slider        - 更高优先级实时输入，但故障不能拖死Core 0
+     * ⭐⭐⭐⭐    AIR                  - 高实时性输入
+     * ⭐        CDC/Monitor          - 低优先级调试接口
+     * ⭐        Flash Save           - 仅在SAVE命令时执行
+     *
+     * 【关键原则】
+     * 1. MPR121正常时：必须优先保证其扫描频率和实时性
+     * 2. MPR121异常时：快速失败，不阻塞AIR和USB HID
+     * 3. AIR必须完全独立于MPR121，即使MPR121全部失败，AIR仍正常运行
+     * 4. 任何单个实时任务的最坏执行时间必须有界（<5ms）
+     * 5. USB HID不能被任何输入设备长时间阻塞
+     *
+     * 【架构改进】
+     * - MPR121 I2C使用极短timeout（500us），失败立即返回
+     * - CDC任务限制每次处理的字节数，避免大量数据阻塞
+     * - Monitor输出按间隔调用，不会频繁阻塞
+     * - Flash操作只在SAVE命令时执行，不在主循环中
+     *
+     * ==============================================================================
+     */
     while (1) {
         // 性能统计：记录循环开始时间
         uint64_t loop_start = time_us_64();
 
+        // ===== TinyUSB Task（最高优先级，必须持续运行）=====
         tud_task();
+
+        // ===== CDC任务（低优先级，限制每次处理量）=====
         cdc_task();
 
+        // ===== Slider更新（更高优先级实时输入，非阻塞）=====
+        // MPR121 I2C使用极短timeout，失败立即返回
+        // 正常：<3ms（3个设备，每个<1ms）
+        // 异常：最多3ms（即使所有设备都失败）
         slider_update();
 #if DEBUG_MPR121
         mpr121_debug_tick();
 #endif
+
+        // ===== AIR更新（高实时性输入，完全独立）=====
+        // 仅依赖Core 1 TOF snapshot，不依赖MPR121
         air_update();
+
+        // ===== 物理按钮更新（非阻塞GPIO读取）=====
         button_update();
 
+        // ===== HID Report生成和发送（必须持续运行）=====
         gen_nkro_report();
         report_usb_hid();
 
-        save_loop();
+        // ===== 低优先级后台任务 =====
+        save_loop();  // 当前为空，Flash操作只在SAVE命令时执行
 
         // 性能统计：计算循环耗时
         uint64_t loop_end = time_us_64();
@@ -589,7 +640,7 @@ int main(void) {
         // 滑动平均
         main_loop_avg_us = (main_loop_avg_us * 9 + loop_duration) / 10;
 
-        // 监控模式：定期输出数据
+        // 监控模式：定期输出数据（低优先级）
         if (monitor_mode) {
             uint64_t now = time_us_64();
             uint32_t elapsed_ms = (now - last_monitor_time) / 1000;

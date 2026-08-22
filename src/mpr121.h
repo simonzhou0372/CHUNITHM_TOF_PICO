@@ -32,13 +32,28 @@
 
 #if MPR121_TOUCH_BARRIER_MODE == 1
 /* 物体间隔模式：低阈值，高灵敏度 */
-#define MPR121_DEFAULT_TOUCH_THRESHOLD    3
+#define MPR121_DEFAULT_TOUCH_THRESHOLD    2
 #define MPR121_DEFAULT_RELEASE_THRESHOLD   1
 #else
 /* 直接接触模式：高阈值，稳定可靠（默认） */
 #define MPR121_DEFAULT_TOUCH_THRESHOLD    20
 #define MPR121_DEFAULT_RELEASE_THRESHOLD  18
 #endif
+
+/*
+ * ===== MPR121 Non-Blocking I2C Configuration =====
+ *
+ * 关键参数：
+ * - I2C_TIMEOUT_US: 初始化时的timeout（允许较长，因为只在启动时执行）
+ * - I2C_UPDATE_TIMEOUT_US: update时的timeout（必须极短，避免阻塞主循环）
+ *
+ * 设计原则：
+ * - MPR121正常时：必须快速完成（每个设备<1ms）
+ * - MPR121异常时：必须快速失败（不阻塞AIR和USB HID）
+ * - 单次主循环中，所有MPR121操作的总时间必须有界（<3ms）
+ */
+#define MPR121_I2C_INIT_TIMEOUT_US    10000   /* 初始化timeout: 10ms */
+#define MPR121_I2C_UPDATE_TIMEOUT_US  500     /* update timeout: 500us (极短) */
 
 /*
  * ===== MPR121 Debug System =====
@@ -63,7 +78,7 @@
  *   - Event reads: only triggered on state transitions
  *   - Stats print: rate-limited to MPR121_DEBUG_STAT_INTERVAL_MS
  */
-#define DEBUG_MPR121                    0   /* 0 = disable, 1 = enable           */
+#define DEBUG_MPR121                    1  /* 0 = disable, 1 = enable           */
 #define MPR121_DEBUG_FIRST_ELECTRODE    0   /* first electrode to monitor (0-5)  */
 #define MPR121_DEBUG_LAST_ELECTRODE     5   /* last  electrode to monitor (0-5)  */
                                             /* NOTE: E6+ baseline is unreadable  */

@@ -104,36 +104,37 @@ static uint32_t touch_state[3] = {0, 0, 0};
 static bool mpr_ready[3] = {false, false, false};
 static uint32_t i2c_error_count[3] = {0, 0, 0};  // I2C 错误计数
 
-#define I2C_TIMEOUT_US 1000000
-
-// Write byte to MPR121 with timeout
+// Write byte to MPR121 with specified timeout
+// Used during initialization (longer timeout OK, only runs once)
 static bool mpr_write_byte(uint8_t addr, uint8_t reg, uint8_t value) {
     uint8_t buf[2] = {reg, value};
     int ret = i2c_write_blocking_until(I2C0_PORT, addr, buf, 2, false,
-                                        time_us_64() + I2C_TIMEOUT_US);
+                                        time_us_64() + MPR121_I2C_INIT_TIMEOUT_US);
     return ret >= 0;
 }
 
-// Read byte from MPR121 with timeout
+// Read byte from MPR121 with specified timeout
+// Used during initialization (longer timeout OK, only runs once)
 static bool mpr_read_byte(uint8_t addr, uint8_t reg, uint8_t *value) {
     int ret = i2c_write_blocking_until(I2C0_PORT, addr, &reg, 1, true,
-                                        time_us_64() + I2C_TIMEOUT_US);
+                                        time_us_64() + MPR121_I2C_INIT_TIMEOUT_US);
     if (ret < 0) return false;
 
     ret = i2c_read_blocking_until(I2C0_PORT, addr, value, 1, false,
-                                   time_us_64() + I2C_TIMEOUT_US);
+                                   time_us_64() + MPR121_I2C_INIT_TIMEOUT_US);
     return ret >= 0;
 }
 
 // Read 16-bit value from MPR121 (little-endian)
+// Used during initialization (longer timeout OK, only runs once)
 static bool mpr_read_word(uint8_t addr, uint8_t reg, uint16_t *value) {
     uint8_t buf[2];
     int ret = i2c_write_blocking_until(I2C0_PORT, addr, &reg, 1, true,
-                                        time_us_64() + I2C_TIMEOUT_US);
+                                        time_us_64() + MPR121_I2C_INIT_TIMEOUT_US);
     if (ret < 0) return false;
 
     ret = i2c_read_blocking_until(I2C0_PORT, addr, buf, 2, false,
-                                   time_us_64() + I2C_TIMEOUT_US);
+                                   time_us_64() + MPR121_I2C_INIT_TIMEOUT_US);
     if (ret < 0) return false;
 
     *value = buf[0] | (buf[1] << 8);  // Little-endian
@@ -191,10 +192,26 @@ static bool mpr_init_single(uint8_t addr, int index) {
     // Debounce = 0 (无去抖，最低延迟)
     mpr_write_byte(addr, MPR121_DEBOUNCE, 0x00);
 
+/*
+CDT 编码 (二进制)	CDT 值 (十进制)	充电/放电时间	CONFIG2 十六进制
+000	0	0.5 µs (默认)	0x02
+001	1	1 µs	0x22
+010	2	2 µs	0x42
+011	3	4 µs	0x62
+100	4	8 µs	0x82
+101	5	16 µs	0xA2
+110	6	32 µs	0xC2
+111	7	64 µs (最大值)	0xE2
+*/
+#if MPR121_TOUCH_BARRIER_MODE == 1
+    // CONFIG1 和 CONFIG2
+    mpr_write_byte(addr, MPR121_CONFIG1, 0x3F);
+    mpr_write_byte(addr, MPR121_CONFIG2, 0x22);
+#else
     // CONFIG1 和 CONFIG2
     mpr_write_byte(addr, MPR121_CONFIG1, 0x35);
     mpr_write_byte(addr, MPR121_CONFIG2, 0x02);
-
+#endif
     // 不使用 Auto-Configuration
     // 让 Baseline 自然稳定即可
 
@@ -272,33 +289,74 @@ void mpr121_set_thresholds(uint8_t touch_thr, uint8_t release_thr) {
            touch_thr, release_thr, touch_thr - release_thr);
 }
 
+/*
+ * mpr121_update() - Non-Blocking Touch Status Read
+ *
+ * ==============================================================================
+ * 架构说明
+ * ==============================================================================
+ *
+ * 【核心原则】
+ * MPR121是比AIR更高优先级的实时输入，但MPR121的故障不能拖死整个Core 0。
+ *
+ * 【设计目标】
+ * 1. MPR121正常时：保持高刷新率，快速读取（每个设备<1ms）
+ * 2. MPR121异常时：快速失败，不阻塞AIR和USB HID
+ * 3. 单次调用总执行时间有界（<3ms，即使所有设备都失败）
+ *
+ * 【实现方式】
+ * - 使用极短timeout（500us）
+ * - 对每个MPR121设备：
+ *   - 尝试I2C write
+ *   - 失败 → 立即跳过该设备，继续下一个
+ *   - 成功 → 尝试I2C read
+ *   - 失败 → 立即跳过该设备，继续下一个
+ *   - 成功 → 更新touch_state
+ * - 不retry，不等待
+ * - 失败的设备保留上一次的有效状态
+ *
+ * 【最坏情况】
+ * 如果所有3个MPR121的I2C都失败：
+ * - 每个设备：1次write timeout + 1次read timeout
+ * - 总时间：3 × 2 × 500us = 3ms
+ * - 远低于原来的60ms
+ *
+ * ==============================================================================
+ */
 void mpr121_update() {
+    // 遍历所有MPR121设备
     for (int i = 0; i < 3; i++) {
+        // 检查设备是否就绪
         if (!mpr_ready[i]) {
-            touch_state[i] = 0;
+            // 设备未初始化，保持旧状态（0）
             continue;
         }
 
+        // 准备读取touch status寄存器
         uint8_t status[2] = {0, 0};
         uint8_t reg = MPR121_TOUCHSTATUS_L;
 
+        // 第一步：I2C write（发送寄存器地址）
+        // 使用极短timeout，失败立即跳过
         int ret = i2c_write_blocking_until(I2C0_PORT, mpr_addr[i], &reg, 1, true,
-                                            time_us_64() + 10000);
+                                            time_us_64() + MPR121_I2C_UPDATE_TIMEOUT_US);
         if (ret < 0) {
-            // I2C 写入失败，记录错误但保持旧状态
+            // I2C写入失败，记录错误，保持旧状态，继续下一个设备
             i2c_error_count[i]++;
-            continue;
+            continue;  // 快速失败，不阻塞
         }
 
+        // 第二步：I2C read（读取touch status）
+        // 使用极短timeout，失败立即跳过
         ret = i2c_read_blocking_until(I2C0_PORT, mpr_addr[i], status, 2, false,
-                                       time_us_64() + 10000);
+                                       time_us_64() + MPR121_I2C_UPDATE_TIMEOUT_US);
         if (ret < 0) {
-            // I2C 读取失败，记录错误但保持旧状态
+            // I2C读取失败，记录错误，保持旧状态，继续下一个设备
             i2c_error_count[i]++;
-            continue;
+            continue;  // 快速失败，不阻塞
         }
 
-        // 成功读取，更新状态
+        // 成功读取，更新touch_state
         touch_state[i] = status[0] | ((uint32_t)status[1] << 8);
     }
 }
