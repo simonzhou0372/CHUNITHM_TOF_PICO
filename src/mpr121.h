@@ -28,12 +28,12 @@
  *   - 重新编译固件
  *   - 运行时仍可通过 CONFIG 命令调整
  */
-#define MPR121_TOUCH_BARRIER_MODE     0    /* 0=直接接触, 1=物体间隔 */
+#define MPR121_TOUCH_BARRIER_MODE     1    /* 0=直接接触, 1=物体间隔 */
 
 #if MPR121_TOUCH_BARRIER_MODE == 1
 /* 物体间隔模式：低阈值，高灵敏度 */
-#define MPR121_DEFAULT_TOUCH_THRESHOLD    10
-#define MPR121_DEFAULT_RELEASE_THRESHOLD   8
+#define MPR121_DEFAULT_TOUCH_THRESHOLD    3
+#define MPR121_DEFAULT_RELEASE_THRESHOLD   1
 #else
 /* 直接接触模式：高阈值，稳定可靠（默认） */
 #define MPR121_DEFAULT_TOUCH_THRESHOLD    20
