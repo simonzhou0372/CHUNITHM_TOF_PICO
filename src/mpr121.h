@@ -28,12 +28,16 @@
  *   - 重新编译固件
  *   - 运行时仍可通过 CONFIG 命令调整
  */
-#define MPR121_TOUCH_BARRIER_MODE     1    /* 0=直接接触, 1=物体间隔 */
+#define MPR121_TOUCH_BARRIER_MODE     2    /* 0=直接接触, 1=物体间隔, 2=物体间隔+手套 */
 
 #if MPR121_TOUCH_BARRIER_MODE == 1
 /* 物体间隔模式：低阈值，高灵敏度 */
-#define MPR121_DEFAULT_TOUCH_THRESHOLD    2
-#define MPR121_DEFAULT_RELEASE_THRESHOLD   1
+#define MPR121_DEFAULT_TOUCH_THRESHOLD    3
+#define MPR121_DEFAULT_RELEASE_THRESHOLD   2
+#elif MPR121_TOUCH_BARRIER_MODE == 2
+/* 物体间隔模式 + 手套：中等阈值 */
+#define MPR121_DEFAULT_TOUCH_THRESHOLD    3
+#define MPR121_DEFAULT_RELEASE_THRESHOLD   2
 #else
 /* 直接接触模式：高阈值，稳定可靠（默认） */
 #define MPR121_DEFAULT_TOUCH_THRESHOLD    20
@@ -78,7 +82,7 @@
  *   - Event reads: only triggered on state transitions
  *   - Stats print: rate-limited to MPR121_DEBUG_STAT_INTERVAL_MS
  */
-#define DEBUG_MPR121                    1  /* 0 = disable, 1 = enable           */
+#define DEBUG_MPR121                    0  /* 0 = disable, 1 = enable           */
 #define MPR121_DEBUG_FIRST_ELECTRODE    0   /* first electrode to monitor (0-5)  */
 #define MPR121_DEBUG_LAST_ELECTRODE     5   /* last  electrode to monitor (0-5)  */
                                             /* NOTE: E6+ baseline is unreadable  */

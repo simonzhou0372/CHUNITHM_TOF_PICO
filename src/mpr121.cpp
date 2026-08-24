@@ -171,14 +171,14 @@ static bool mpr_init_single(uint8_t addr, int index) {
         mpr_write_byte(addr, MPR121_RELEASETH_L + i * 2, release_thr);
     }
 
-    // Filter configuration - 经过大量实际验证的参数
-    // Rising filter (手指离开后 Baseline 恢复跟踪)
+    // Filter configuration 
+    // Rising filter 
     mpr_write_byte(addr, MPR121_MHDR, 0x01);
     mpr_write_byte(addr, MPR121_NHDR, 0x01);
     mpr_write_byte(addr, MPR121_NCLR, 0x0E);
     mpr_write_byte(addr, MPR121_FDLR, 0x00);
 
-    // Falling filter (手指按住时 Baseline 跟踪)
+    // Falling filter
     mpr_write_byte(addr, MPR121_MHDF, 0x01);
     mpr_write_byte(addr, MPR121_NHDF, 0x05);
     mpr_write_byte(addr, MPR121_NCLF, 0x01);
@@ -205,7 +205,11 @@ CDT 编码 (二进制)	CDT 值 (十进制)	充电/放电时间	CONFIG2 十六进
 */
 #if MPR121_TOUCH_BARRIER_MODE == 1
     // CONFIG1 和 CONFIG2
-    mpr_write_byte(addr, MPR121_CONFIG1, 0x3F);
+    mpr_write_byte(addr, MPR121_CONFIG1, 0x35);
+    mpr_write_byte(addr, MPR121_CONFIG2, 0x22);
+#elif MPR121_TOUCH_BARRIER_MODE == 2
+    // CONFIG1 和 CONFIG2
+    mpr_write_byte(addr, MPR121_CONFIG1, 0x25);
     mpr_write_byte(addr, MPR121_CONFIG2, 0x22);
 #else
     // CONFIG1 和 CONFIG2
