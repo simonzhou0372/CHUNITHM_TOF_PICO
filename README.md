@@ -26,6 +26,9 @@ A precision Chunithm controller using capacitive touch sensors and TOF distance 
 - [快速开始](#-快速开始)
 - [硬件](#-硬件)
 - [固件](#-固件)
+  - [下载](#-下载)
+  - [烧录方法](#-烧录方法)
+  - [MPR121 触摸灵敏度模式选择](#-mpr121-触摸灵敏度模式选择)
 - [组装](#-组装)
 - [配置工具](#-配置工具)
 - [开发路线图](#-开发路线图)
@@ -254,6 +257,26 @@ cell32=0xBC   ; ,
 4. 拖放 `Chuni245Tof.uf2` 到 RPI-RP2 驱动器
 5. 自动重启完成
 
+### MPR121 触摸灵敏度模式选择
+
+本控制器支持三种触摸灵敏度模式，适配不同的触摸介质。模式在 **上电时** 通过按键选择：
+
+| 按键组合 | 模式 | 适用场景 | Touch/Release 阈值 |
+|---------|------|---------|-------------------|
+| 不按按键（默认） | 物体间隔+手套 | 透过亚克力板，戴手套游玩 | 3 / 2 |
+| 按住 **CARD** 上电 | 物体间隔 | 透过亚克力板，不戴手套 | 3 / 2 |
+| 按住 **SERVICE** 上电 | 直接接触 | 直接触摸传感器（无亚克力） | 20 / 18 |
+
+**操作方法：**
+1. 按住对应按键（CARD 或 SERVICE）
+2. 连接 USB 线上电
+3. 等待 0.5 秒后松开按键
+4. 模式已选定，正常运行
+
+> 💡 **提示**：SERVICE 优先级高于 CARD。如果同时按住两个按键，将进入"直接接触"模式。
+
+> ⚠️ **注意**：模式选择仅在 **上电时** 有效，运行中按键只作为普通键盘输入（CARD = ENTER，SERVICE = 数字 2）。
+
 ---
 
 ## 🔨 组装
@@ -307,16 +330,19 @@ python tools/config_cdc.py
 ### CONFIG 参数说明
 
 ```
-CONFIG <touch> <release> <offset> <pitch> <air6_range> <min_hold>
+CONFIG <touch> <release> <offset> <pitch> <air12_range> <min_hold> [overlay]
 
 参数:
-  touch      - 触摸阈值 (1-255, 默认 10)
-  release    - 释放阈值 (1-255, 默认 8)
-  offset     - Air 起始高度 mm (40-200, 默认 120)
-  pitch      - Air 每级高度 mm (4-100, 默认 30)
-  air6_range - Air6 检测范围 mm (pitch-200, 默认 150)
-  min_hold   - 最小按下时间 ms (10-500, 默认 100)
+  touch       - 触摸阈值 (1-255, 默认 10)
+  release     - 释放阈值 (1-255, 默认 8)
+  offset      - Air 起始高度 mm (40-200, 默认 120)
+  pitch       - Air 每级高度 mm (4-100, 默认 30)
+  air12_range - Air12 检测范围 mm (pitch-255, 默认 150)
+  min_hold    - 最小按下时间 ms (10-500, 默认 100)
+  overlay     - Air Overlay 模式 (0=关闭, 1=开启, 默认 1)
 ```
+
+> 📌 **Air Overlay 模式**：开启后启用 Air7~Air12 六个额外高度层，Air1~Air6 映射到键盘 4~9，Air7~Air12 同样映射到 4~9（OR 逻辑）。
 
 ---
 
