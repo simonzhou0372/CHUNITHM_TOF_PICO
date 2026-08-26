@@ -7,6 +7,10 @@
  * 2. 实现滞回机制避免边界抖动
  * 3. 使用数据有效性检查
  * 4. 完善最小按下持续时间
+ * 5. AIR Overlay Mode - 扩展到 12 层 AIR 检测
+ *    - AIR1~AIR6: 原始距离层
+ *    - AIR7~AIR12: AIR6 上方的扩展层 (仅当 overlay_enabled)
+ *    - HID 映射: AIR1/AIR7 -> key1, AIR2/AIR8 -> key2, ...
  */
 
 #include "air.h"
@@ -18,17 +22,21 @@
 
 namespace Chuni245Tof {
 
-// Air 传感器状态 (6 bits for height levels)
-static uint8_t air_state = 0;  // 传感器状态 bitmap
+// Air 传感器状态 (12-bit bitmap)
+// bit0 = AIR1, bit1 = AIR2, ..., bit5 = AIR6
+// bit6 = AIR7, bit7 = AIR8, ..., bit11 = AIR12
+static uint16_t air_state = 0;
 
-// HID 输出状态 (经过最小按下时间处理)
+// HID 输出状态 (6-bit bitmap, 经过最小按下时间处理)
+// bit0 = key1, bit1 = key2, ..., bit5 = key6
+// key1 = AIR1 || AIR7, key2 = AIR2 || AIR8, ...
 static uint8_t hid_air_bitmap = 0;
 
 // 当前最大距离
 static uint16_t current_distance = 0;
 
-// 每个 AIR 的按下时间 (ms)
-static uint32_t air_press_time[6] = {0};
+// 每个 AIR 的按下时间 (ms) - 扩展到 12 个
+static uint32_t air_press_time[12] = {0};
 
 // 调试数据
 static air_debug_data_t debug_data = {0};
@@ -41,12 +49,16 @@ static air_debug_data_t debug_data = {0};
 // 滞回参数（mm）
 #define HYSTERESIS_MM   5       // 滞回区间大小
 
+// AIR 层数定义
+#define AIR_LAYERS_ORIGINAL  6   // 原始 AIR 层数 (AIR1~AIR6)
+#define AIR_LAYERS_OVERLAY   12  // 扩展 AIR 层数 (AIR1~AIR12)
+
 void air_init() {
     tof_reader_init();  // 启动 Core 1 读取任务
     air_state = 0;
     hid_air_bitmap = 0;
     current_distance = 0;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 12; i++) {
         air_press_time[i] = 0;
     }
     memset(&debug_data, 0, sizeof(debug_data));
@@ -54,11 +66,12 @@ void air_init() {
 
 void air_update() {
     // Get config parameters (in mm)
-    // Default: offset=120mm, pitch=30mm, air6_range=150mm
+    // Default: offset=120mm, pitch=30mm, air12_range=150mm
     uint16_t offset_mm = cfg ? cfg->tof_offset : 120;
     uint16_t pitch_mm = cfg ? cfg->tof_pitch : 30;
-    uint16_t air6_range_mm = cfg ? cfg->air6_range : 150;
+    uint16_t air12_range_mm = cfg ? cfg->air12_range : 150;
     uint16_t min_hold_ms = cfg ? cfg->air_min_hold_ms : 100;
+    bool overlay_enabled = cfg ? (cfg->air_overlay_enabled != 0) : true;
 
     // ===== 收集传感器数据并计算最大值 =====
     uint16_t max_value = 0;
@@ -104,23 +117,38 @@ void air_update() {
     current_distance = max_value;
 
     // ===== 计算 AIR 分段（带滞回） =====
-    uint8_t sensor_bitmap = 0;
+    // 确定检测层数
+    int num_layers = overlay_enabled ? AIR_LAYERS_OVERLAY : AIR_LAYERS_ORIGINAL;
+
+    uint16_t sensor_bitmap = 0;
 
     // 计算各个 AIR 层的阈值
-    // Air1: [offset, offset + pitch]
-    // Air2: [offset + pitch, offset + pitch*2]
+    // ========================================
+    // 新设计：AIR1~AIR11 线性，AIR12 特殊范围
+    // ========================================
+    // AIR1:  [offset, offset + pitch)
+    // AIR2:  [offset + pitch, offset + pitch*2)
     // ...
-    // Air6: [offset + pitch*5, offset + pitch*5 + air6_range]
+    // AIR11: [offset + pitch*10, offset + pitch*11)
+    // AIR12: [offset + pitch*11, offset + pitch*11 + air12_range)
+    //
+    // 所有 AIR 层（包括 overlay）都是线性的，
+    // 只有 AIR12 有更大的检测范围
 
-    uint16_t thresholds[7];  // 6个层的边界
+    // 阈值数组: 13 个边界值定义 12 个区间
+    uint16_t thresholds[13];
     thresholds[0] = offset_mm;
-    for (int i = 1; i <= 5; i++) {
+
+    // AIR1~AIR11 边界（线性，每层高度 = pitch）
+    for (int i = 1; i <= 11; i++) {
         thresholds[i] = offset_mm + pitch_mm * i;
     }
-    thresholds[6] = offset_mm + pitch_mm * 5 + air6_range_mm;
+
+    // AIR12 上边界（特殊范围）
+    thresholds[12] = offset_mm + pitch_mm * 11 + air12_range_mm;
 
     // 使用滞回机制判断各个 AIR 层
-    for (int layer = 0; layer < 6; layer++) {
+    for (int layer = 0; layer < num_layers; layer++) {
         uint16_t enter_threshold = thresholds[layer];
         uint16_t exit_threshold = thresholds[layer] - HYSTERESIS_MM;
 
@@ -143,13 +171,45 @@ void air_update() {
 
     air_state = sensor_bitmap;
 
+    // ===== HID 输出计算 =====
+    //
+    // HID key 映射 (OR 逻辑):
+    //   key1 = AIR1 || AIR7
+    //   key2 = AIR2 || AIR8
+    //   key3 = AIR3 || AIR9
+    //   key4 = AIR4 || AIR10
+    //   key5 = AIR5 || AIR11
+    //   key6 = AIR6 || AIR12
+    //
+    // 最小按下时间处理在 OR 之后的 key 上进行
+
+    // 计算原始 HID 状态 (OR 映射)
+    uint8_t raw_hid_bitmap = 0;
+    for (int key = 0; key < 6; key++) {
+        bool key_pressed = false;
+
+        // AIR1~AIR6 对应 key0~key5
+        if (sensor_bitmap & (1 << key)) {
+            key_pressed = true;
+        }
+
+        // AIR7~AIR12 对应 key0~key5 (overlay)
+        if (overlay_enabled && (sensor_bitmap & (1 << (key + 6)))) {
+            key_pressed = true;
+        }
+
+        if (key_pressed) {
+            raw_hid_bitmap |= (1 << key);
+        }
+    }
+
     // ===== 最小按下持续时间处理 =====
     // 当传感器检测到 Air 时，HID 立即 ON
     // ON 后至少保持 min_hold_ms
     // 最小保持时间到了以后，如果传感器已经 OFF，则立即 OFF
 
     for (int i = 0; i < 6; i++) {
-        bool sensor_on = (sensor_bitmap >> i) & 1;
+        bool sensor_on = (raw_hid_bitmap >> i) & 1;
         bool hid_on = (hid_air_bitmap >> i) & 1;
 
         if (sensor_on && !hid_on) {
@@ -175,13 +235,17 @@ void air_update() {
 
     // 更新调试数据
     debug_data.max_distance = max_value;
-    debug_data.sensor_bitmap = sensor_bitmap;
-    debug_data.hid_bitmap = hid_air_bitmap;
+    debug_data.sensor_bitmap = sensor_bitmap;  // 12-bit
+    debug_data.hid_bitmap = hid_air_bitmap;    // 6-bit
     debug_data.timestamp_us = time_us_32();
 }
 
 uint8_t air_get_bitmap() {
-    return hid_air_bitmap;  // 返回 HID 输出状态
+    return hid_air_bitmap;  // 返回 HID 输出状态 (6-bit)
+}
+
+uint16_t air_get_air_state() {
+    return air_state;  // 返回完整的 AIR 状态 (12-bit, 用于调试)
 }
 
 bool air_is_triggered(uint8_t sensor) {

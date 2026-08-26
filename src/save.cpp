@@ -46,8 +46,9 @@ typedef struct {
     uint8_t release_threshold;
     uint8_t tof_offset;
     uint8_t tof_pitch;
-    uint8_t air6_range;
+    uint8_t air12_range;         // AIR12 特殊检测范围（原 air6_range）
     uint16_t air_min_hold_ms;
+    uint8_t air_overlay_enabled; // AIR Overlay Mode (0=OFF, 1=ON)
     uint16_t air_threshold[5];
 
     uint32_t crc32;        // CRC32 校验

@@ -5,8 +5,9 @@
  * 改进：
  * 1. 只有 VL53L0X 真正产生新数据时才更新 timestamp
  * 2. 使用 sequence counter 保证 Core 0 读取一致性
- * 3. 优化 polling 策略，减少无效 I2C transaction
- * 4. 性能统计
+ * 3. 真正的非阻塞轮询：传感器未就绪时立即跳过
+ * 4. 不基于理论 timing budget 猜测数据就绪时间
+ * 5. 高速轮询，避免人为延迟
  */
 
 #include "tof_reader.h"
@@ -45,18 +46,8 @@ static volatile uint32_t total_poll_count = 0;  // 总轮询次数
 static volatile uint32_t avg_poll_interval_us = 0;
 static volatile uint32_t max_poll_interval_us = 0;
 
-// 每个 VL53L0X 的轮询状态
-typedef struct {
-    uint32_t last_check_time_us;  // 上次检查时间
-    bool expecting_data;          // 是否期待新数据
-    uint32_t next_ready_time_us;  // 预计下次数据就绪时间
-} sensor_poll_state_t;
-
-static sensor_poll_state_t poll_state[5] = {0};
-
-// VL53L0X 测量周期（约 20ms）
-#define VL53L0X_MEASUREMENT_PERIOD_US  20000
-#define VL53L0X_MIN_POLL_INTERVAL_US   300  // 最小轮询间隔 300us（从 2ms 降低）
+// 极短的轮询间隔（避免 Core1 100% 空转）
+#define MIN_POLL_SLEEP_US  100  // 100us，极短，不会造成明显延迟
 
 // ===== Core 1 主循环 =====
 static void core1_main() {
@@ -67,64 +58,39 @@ static void core1_main() {
     sleep_ms(100);
 
     printf("[TOF_READER] Core 1 reading loop started\n");
+    printf("[TOF_READER] High-speed non-blocking polling mode\n");
 
     uint32_t loop_start_time = time_us_32();
-    uint32_t last_log_time = loop_start_time;
 
-    // 初始化轮询状态
-    uint32_t now_us = time_us_32();
+    // 初始化传感器数据状态
     for (int i = 0; i < 5; i++) {
-        poll_state[i].last_check_time_us = now_us;
-        poll_state[i].expecting_data = true;  // 启动时期待数据
-        poll_state[i].next_ready_time_us = now_us + VL53L0X_MEASUREMENT_PERIOD_US;
         sensor_data[i].valid = vl53l0x_is_ready(i);
     }
 
     while (core1_running) {
-        uint32_t loop_now_us = time_us_32();
         uint32_t loop_now_ms = to_ms_since_boot(get_absolute_time());
 
         total_poll_count++;
 
-        // 遍历所有传感器
+        // 高速非阻塞轮询所有传感器
+        // 不猜测何时数据就绪，而是直接检查每个传感器
         for (int i = 0; i < 5; i++) {
-            // 优化后的轮询策略：
-            // 1. 如果接近预计就绪时间（< 2ms），高频检查（每 200us）
-            // 2. 否则每 300us 检查一次
-            // 3. 确保不错过数据就绪窗口
-
-            int32_t time_to_next_ready = (int32_t)(poll_state[i].next_ready_time_us - loop_now_us);
-            int32_t time_since_last_check = (int32_t)(loop_now_us - poll_state[i].last_check_time_us);
-
-            bool should_check = false;
-
-            if (time_to_next_ready <= 2000 && time_since_last_check >= 150) {
-                // 接近预计就绪时间（< 2ms），高频检查（每 150us）
-                should_check = true;
-            } else if (time_since_last_check >= VL53L0X_MIN_POLL_INTERVAL_US) {
-                // 超过最小轮询间隔（300us），检查
-                should_check = true;
-            }
-
-            if (!should_check) {
-                continue;
-            }
-
-            // 更新检查时间
-            poll_state[i].last_check_time_us = loop_now_us;
-
-            // 检查传感器是否就绪
+            // 检查传感器是否已初始化
             if (!vl53l0x_is_ready(i)) {
                 sensor_data[i].valid = false;
                 continue;
             }
 
-            // 尝试读取新数据
+            // 尝试读取新数据（非阻塞）
+            // vl53l0x_read_distance 内部会：
+            // 1. 检查 data-ready status
+            // 2. 如果就绪，读取距离并清除中断标志
+            // 3. 如果未就绪，立即返回 false
             uint16_t distance = 0;
             bool got_new_data = vl53l0x_read_distance(i, &distance);
 
             if (got_new_data) {
-                // 真正获得了新数据，更新缓冲区
+                // 真正获得了新数据，立即更新缓冲区
                 // 使用 sequence counter 保证一致性
                 uint32_t seq = sensor_data[i].sequence + 1;
 
@@ -139,12 +105,8 @@ static void core1_main() {
                 // 更新统计
                 new_data_count++;
                 read_count++;
-
-                // 更新预计下次就绪时间
-                poll_state[i].next_ready_time_us = loop_now_us + VL53L0X_MEASUREMENT_PERIOD_US;
-                poll_state[i].expecting_data = false;
             }
-            // 如果没有新数据，不更新任何状态，保持旧值
+            // 如果没有新数据，立即跳过，不等待，不更新任何状态
         }
 
         // 性能统计：计算轮询间隔
@@ -159,26 +121,9 @@ static void core1_main() {
         // 滑动平均计算
         avg_poll_interval_us = (avg_poll_interval_us * 9 + loop_duration) / 10;
 
-        // 动态休眠策略：
-        // - 找出最近一个传感器预计就绪的时间
-        // - 如果有传感器即将就绪（< 1ms），不休眠或只休眠极短时间
-        // - 否则休眠最多 200us（从固定的 500us 降低）
-
-        uint32_t min_time_to_ready = 0xFFFFFFFF;
-        for (int i = 0; i < 5; i++) {
-            int32_t ttr = (int32_t)(poll_state[i].next_ready_time_us - loop_end_time);
-            if (ttr > 0 && ttr < (int32_t)min_time_to_ready) {
-                min_time_to_ready = ttr;
-            }
-        }
-
-        if (min_time_to_ready <= 800) {
-            // 有传感器即将就绪（< 800us），不休眠或只休眠极短时间
-            sleep_us(50);  // 只休眠 50us
-        } else {
-            // 休眠一小段时间，但最多 200us
-            sleep_us(200);
-        }
+        // 极短的休眠，避免 Core1 100% 空转
+        // 不基于任何理论 timing budget，只是一个固定的小延迟
+        sleep_us(MIN_POLL_SLEEP_US);
     }
 
     core1_running = false;

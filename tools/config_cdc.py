@@ -138,8 +138,8 @@ class LanguageManager:
                 self.LANG_EN: "Pitch:"
             },
             'air6_range': {
-                self.LANG_CN: "Air6范围:",
-                self.LANG_EN: "Air6 Range:"
+                self.LANG_CN: "Air12范围:",
+                self.LANG_EN: "Air12 Range:"
             },
             'min_hold': {
                 self.LANG_CN: "最小保持:",
@@ -400,7 +400,7 @@ class ConfigApp:
         # TOF visualization parameters
         self.tof_offset = 120
         self.tof_pitch = 30
-        self.air6_range = 150
+        self.air12_range = 150
 
         # Canvas drawing items - created once, updated with coords
         self.tof_zone_items = []      # Background zone rectangles
@@ -524,8 +524,8 @@ class ConfigApp:
         air6_label.grid(row=2, column=0, sticky='w')
         self.lang_widgets['air6_label'] = air6_label
 
-        self.air6_range_var = tk.StringVar(value="150")
-        ttk.Entry(tof_frame, textvariable=self.air6_range_var, width=5).grid(row=2, column=1, padx=2)
+        self.air12_range_var = tk.StringVar(value="150")
+        ttk.Entry(tof_frame, textvariable=self.air12_range_var, width=5).grid(row=2, column=1, padx=2)
         ttk.Label(tof_frame, text="mm", width=4).grid(row=2, column=2)
 
         hold_label = ttk.Label(tof_frame, text=lang_manager.get('min_hold'))
@@ -536,9 +536,15 @@ class ConfigApp:
         ttk.Entry(tof_frame, textvariable=self.air_hold_var, width=5).grid(row=3, column=1, padx=2)
         ttk.Label(tof_frame, text="ms", width=4).grid(row=3, column=2)
 
+        # Overlay checkbox
+        self.overlay_var = tk.BooleanVar(value=True)
+        overlay_cb = ttk.Checkbutton(tof_frame, text="Overlay", variable=self.overlay_var, width=8)
+        overlay_cb.grid(row=4, column=0, columnspan=2, sticky='w', padx=2)
+        self.lang_widgets['overlay_cb'] = overlay_cb
+
         tof_help = lang_manager.get('tof_help')
         self.tof_help_label = ttk.Label(tof_frame, text=tof_help, foreground='gray', font=('Arial', 7))
-        self.tof_help_label.grid(row=4, column=0, columnspan=3, sticky='w')
+        self.tof_help_label.grid(row=5, column=0, columnspan=3, sticky='w')
 
         # Buttons - wider to prevent text truncation
         btn_frame = ttk.LabelFrame(params_frame, text=lang_manager.get('actions_frame'), padding=3)
@@ -626,21 +632,28 @@ class ConfigApp:
                                         foreground='blue', width=12, anchor='center')
         self.max_dist_label.pack(pady=2)
 
+        # Overlay status indicator
+        self.overlay_status_label = ttk.Label(air_container, text="Overlay: ON", font=('Arial', 7),
+                                              foreground='green', width=12, anchor='center')
+        self.overlay_status_label.pack(pady=1)
+
         self.air_indicators = []
         air_bars_frame = ttk.Frame(air_container)
         air_bars_frame.pack(pady=1)
 
-        # Air6 on top, Air1 on bottom - FIXED GRID
-        for i in range(5, -1, -1):  # 6, 5, 4, 3, 2, 1
+        # Display AIR1~AIR12 (12 indicators)
+        # AIR6 on top, AIR1 on bottom, then AIR12~AIR7 below AIR1
+        for i in range(11, -1, -1):  # 12, 11, 10, ..., 1
             air_frame = ttk.Frame(air_bars_frame, width=60)
-            air_frame.grid(row=5-i, column=0, pady=0, sticky='w')
+            air_frame.grid(row=11-i, column=0, pady=0, sticky='w')
             air_frame.grid_propagate(False)
 
             # Label - FIXED width
-            ttk.Label(air_frame, text=f"Air{i+1}", font=('Arial', 8), width=5, anchor='e').pack(side='left', padx=2)
+            label_text = f"Air{i+1}"
+            ttk.Label(air_frame, text=label_text, font=('Arial', 7), width=5, anchor='e').pack(side='left', padx=2)
 
-            # Canvas: FIXED SIZE 22x16
-            canvas = tk.Canvas(air_frame, width=22, height=16, bg='#e0e0e0',
+            # Canvas: FIXED SIZE 22x12 (smaller to fit 12 rows)
+            canvas = tk.Canvas(air_frame, width=22, height=12, bg='#e0e0e0',
                              highlightthickness=1, highlightbackground='#999999')
             canvas.pack(side='left')
             self.air_indicators.insert(0, canvas)
@@ -831,17 +844,32 @@ class ConfigApp:
         try:
             self.tof_offset = int(self.tof_offset_var.get())
             self.tof_pitch = int(self.tof_pitch_var.get())
-            self.air6_range = int(self.air6_range_var.get())
-            self.create_tof_visualization()
+            self.air12_range = int(self.air12_range_var.get())
+            # Include overlay layers if enabled
+            overlay_enabled = self.overlay_var.get()
+            self.create_tof_visualization(overlay_enabled)
         except ValueError:
             pass
 
-    def create_tof_visualization(self):
+    def create_tof_visualization(self, overlay_enabled=True):
         """
         Create TOF visualization objects ONCE - never delete during updates
         Only update coords/positions when data changes
+
+        Args:
+            overlay_enabled: If True, show AIR7~AIR12 zones
+
+        新设计: AIR1~AIR11 线性，AIR12 特殊范围
         """
-        max_height = self.tof_offset + self.tof_pitch * 5 + self.air6_range
+        # Calculate max height based on overlay setting
+        if overlay_enabled:
+            # Show AIR1~AIR12
+            # AIR12 上界 = offset + pitch*11 + air12_range
+            max_height = self.tof_offset + self.tof_pitch * 11 + self.air12_range
+        else:
+            # Show only AIR1~AIR6
+            # AIR6 上界 = offset + pitch*5 + air12_range (使用相同的 air12_range 参数)
+            max_height = self.tof_offset + self.tof_pitch * 5 + self.air12_range
 
         # Clear previous items (only called when parameters change, not during monitoring)
         self.tof_zone_items = []
@@ -861,20 +889,22 @@ class ConfigApp:
             canvas.delete("all")
 
             # Draw AIR zones (background - fixed for given parameters)
-            # Air6 (topmost) - Light Coral
-            air6_bottom = max_height
-            air6_top = self.tof_offset + self.tof_pitch * 5
-            y6_bottom = int(height - air6_bottom * scale)
-            y6_top = int(height - air6_top * scale)
-            y6_bottom = max(0, min(height, y6_bottom))
-            y6_top = max(0, min(height, y6_top))
-            zone_item = canvas.create_rectangle(0, y6_top, width, y6_bottom,
+            # 新设计: AIR1~AIR11 线性，AIR12 特殊范围
+
+            # AIR12 (topmost, with special range) - Light Coral
+            air12_bottom = self.tof_offset + self.tof_pitch * 11 + self.air12_range
+            air12_top = self.tof_offset + self.tof_pitch * 11
+            y12_bottom = int(height - air12_bottom * scale)
+            y12_top = int(height - air12_top * scale)
+            y12_bottom = max(0, min(height, y12_bottom))
+            y12_top = max(0, min(height, y12_top))
+            zone_item = canvas.create_rectangle(0, y12_top, width, y12_bottom,
                                                 fill='#FFB6C1', outline='', width=0)
             self.tof_zone_items.append([zone_item])
 
-            # Air1-5 - Light Blue
-            colors = ['#ADD8E6', '#ADD8E6', '#ADD8E6', '#ADD8E6', '#ADD8E6']
-            for j in range(4, -1, -1):
+            # AIR1-11 - Light Blue (all linear, same height = pitch)
+            colors = ['#ADD8E6'] * 11
+            for j in range(10, -1, -1):
                 air_bottom = self.tof_offset + self.tof_pitch * j
                 air_top = self.tof_offset + self.tof_pitch * (j + 1)
                 y_bottom = int(height - air_bottom * scale)
@@ -884,6 +914,11 @@ class ConfigApp:
                 zone_item = canvas.create_rectangle(0, y_top, width, y_bottom,
                                                     fill=colors[j], outline='', width=0)
                 self.tof_zone_items[i].append(zone_item)
+
+            # When overlay is OFF, we only show AIR1~AIR6
+            # Hide AIR7~AIR12 zones by drawing over them or not creating them
+            # For simplicity, we create all zones but the visualization will only
+            # show bars up to the calculated max_height
 
             # Create height bar - INITIALLY HIDDEN (at bottom)
             bar_item = canvas.create_rectangle(0, height, width, height,
@@ -904,7 +939,12 @@ class ConfigApp:
         Update TOF height bars - ONLY update coords, never delete/create
         Called during monitoring - fast and flicker-free
         """
-        max_height = self.tof_offset + self.tof_pitch * 5 + self.air6_range
+        # Use current overlay setting to determine max height
+        overlay_enabled = self.overlay_var.get()
+        if overlay_enabled:
+            max_height = self.tof_offset + self.tof_pitch * 11 + self.air12_range
+        else:
+            max_height = self.tof_offset + self.tof_pitch * 5 + self.air12_range
 
         width = 28
         height = 160
@@ -934,15 +974,30 @@ class ConfigApp:
 
     def update_air_visualization(self):
         """Update AIR indicators + max distance display"""
-        hid_bitmap = self.air_data['hid_bitmap']
+        # Get 12-bit AIR state
+        air_state_12bit = self.air_data.get('sensor_bitmap', 0)
+        overlay_enabled = self.air_data.get('overlay_enabled', True)
 
-        for i in range(6):
-            canvas = self.air_indicators[i]
-
-            if hid_bitmap & (1 << i):
-                canvas.configure(bg='#4169E1')  # Royal Blue
+        # Update overlay status
+        if hasattr(self, 'overlay_status_label'):
+            if overlay_enabled:
+                self.overlay_status_label.config(text="Overlay: ON", foreground='green')
             else:
-                canvas.configure(bg='#e0e0e0')  # Light Gray
+                self.overlay_status_label.config(text="Overlay: OFF", foreground='gray')
+
+        # Update 12 AIR indicators
+        for i in range(12):
+            if i < len(self.air_indicators):
+                canvas = self.air_indicators[i]
+
+                if air_state_12bit & (1 << i):
+                    # Different colors for AIR1-6 vs AIR7-12
+                    if i < 6:
+                        canvas.configure(bg='#4169E1')  # Royal Blue for AIR1-6
+                    else:
+                        canvas.configure(bg='#32CD32')  # Lime Green for AIR7-12 (overlay)
+                else:
+                    canvas.configure(bg='#e0e0e0')  # Light Gray
 
         # Update max distance label
         max_dist = 0
@@ -1052,10 +1107,12 @@ class ConfigApp:
                                 self.tof_offset_var.set(value)
                             elif key == "pitch":
                                 self.tof_pitch_var.set(value)
-                            elif key == "air6":
-                                self.air6_range_var.set(value)
+                            elif key == "air12":
+                                self.air12_range_var.set(value)
                             elif key == "hold":
                                 self.air_hold_var.set(value)
+                            elif key == "overlay":
+                                self.overlay_var.set(value == "1")
                     self.log(lang_manager.get('msg_config_loaded'))
                     self.update_tof_ranges()
             except Exception as e:
@@ -1067,8 +1124,9 @@ class ConfigApp:
             release = int(self.release_thr_var.get())
             offset = int(self.tof_offset_var.get())
             pitch = int(self.tof_pitch_var.get())
-            air6_range = int(self.air6_range_var.get())
+            air12_range = int(self.air12_range_var.get())
             air_hold = int(self.air_hold_var.get())
+            overlay = 1 if self.overlay_var.get() else 0
 
             # Validate (range limits removed for debugging)
             if not (1 <= touch <= 255):
@@ -1083,16 +1141,16 @@ class ConfigApp:
             if not (4 <= pitch <= 100):
                 messagebox.showerror("Error", lang_manager.get('err_pitch_range'))
                 return
-            if not (pitch <= air6_range <= 200):
-                messagebox.showerror("Error", f"{lang_manager.get('err_air6_range')}: {pitch}-200")
+            if not (pitch <= air12_range <= 255):
+                messagebox.showerror("Error", f"{lang_manager.get('err_air6_range')}: {pitch}-255")
                 return
             if not (10 <= air_hold <= 500):
                 messagebox.showerror("Error", lang_manager.get('err_hold_range'))
                 return
 
-            cmd = f"CONFIG {touch} {release} {offset} {pitch} {air6_range} {air_hold}"
+            cmd = f"CONFIG {touch} {release} {offset} {pitch} {air12_range} {air_hold} {overlay}"
             self.send_cmd(cmd)
-            self.update_tof_ranges()
+            self.update_tof_ranges()  # This will use current overlay state
 
         except ValueError:
             messagebox.showerror("Error", lang_manager.get('err_invalid_number'))
@@ -1121,8 +1179,9 @@ class ConfigApp:
                 self.release_thr_var.set("8")
                 self.tof_offset_var.set("120")
                 self.tof_pitch_var.set("30")
-                self.air6_range_var.set("150")
+                self.air12_range_var.set("150")
                 self.air_hold_var.set("100")
+                self.overlay_var.set(True)
                 self.update_tof_ranges()
                 self.log(f"✓ {lang_manager.get('msg_restore_success')}")
                 self.log(lang_manager.get('msg_save_note'))
@@ -1208,7 +1267,16 @@ class ConfigApp:
             # Update AIR state
             if 'air' in data:
                 air = data['air']
+                # Handle both old 6-bit and new 12-bit sensor_bitmap
+                self.air_data['sensor_bitmap'] = air.get('sensor', air.get('hid', 0))
                 self.air_data['hid_bitmap'] = air.get('hid', 0)
+
+                # Try to get overlay status from status if available
+                if 'overlay' in data:
+                    self.air_data['overlay_enabled'] = data['overlay'] == 1
+                else:
+                    self.air_data['overlay_enabled'] = True  # Default
+
                 self.update_air_visualization()
 
             # Update TOF data (skip 8190mm)

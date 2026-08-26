@@ -17,7 +17,8 @@ namespace Chuni245Tof {
 
 void air_init();
 void air_update();
-uint8_t air_get_bitmap();
+uint8_t air_get_bitmap();      // 返回 HID 输出状态 (6-bit: key1~key6)
+uint16_t air_get_air_state();  // 返回完整 AIR 状态 (12-bit: AIR1~AIR12)
 bool air_is_triggered(uint8_t sensor);
 uint16_t air_get_distance(uint8_t sensor);
 
@@ -27,8 +28,8 @@ void air_set_threshold(uint8_t sensor, uint16_t threshold_mm);
 // 获取调试数据
 typedef struct {
     uint16_t max_distance;       // 当前最大距离
-    uint8_t sensor_bitmap;       // 传感器原始状态
-    uint8_t hid_bitmap;          // HID 输出状态
+    uint16_t sensor_bitmap;      // 传感器原始状态 (12-bit: AIR1~AIR12)
+    uint8_t hid_bitmap;          // HID 输出状态 (6-bit: key1~key6)
     uint32_t timestamp_us;       // 更新时间戳
     uint16_t sensor_distances[5]; // 各传感器距离
     uint32_t sensor_ages[5];     // 各传感器数据年龄

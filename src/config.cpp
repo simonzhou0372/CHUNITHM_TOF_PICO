@@ -26,9 +26,10 @@ static const config_t default_config = {
     .touch_threshold = MPR121_DEFAULT_TOUCH_THRESHOLD,      // 由 mpr121.h 定义
     .release_threshold = MPR121_DEFAULT_RELEASE_THRESHOLD,  // 由 mpr121.h 定义
     .tof_offset = 120,                    // Default: 120mm 起始高度
-    .tof_pitch = 30,                      // Default: 30mm step height for air detection
-    .air6_range = 150,                    // Default: 150mm range for Air6 (更大的范围)
+    .tof_pitch = 30,                      // Default: 30mm step height for AIR1~AIR11
+    .air12_range = 150,                   // Default: 150mm range for AIR12 (更大的范围)
     .air_min_hold_ms = 100,               // Default: 100ms 最小按下持续时间
+    .air_overlay_enabled = 1,             // Default: Overlay ON (扩展到 AIR12)
     .air_threshold = {1500, 1500, 1500, 1500, 1500},
 };
 
@@ -38,6 +39,9 @@ static const config_t default_config = {
 
 config_t* cfg = nullptr;
 static config_t config_data;
+
+// Barrier mode (determined at startup, affects default thresholds)
+static uint8_t current_barrier_mode = 2;  // Default: mode 2
 
 //==============================================================================
 // 配置验证
@@ -89,11 +93,11 @@ static bool validate_config(config_t* cfg) {
         modified = true;
     }
 
-    // Air6 范围验证：必须 >= pitch
-    if (cfg->air6_range < cfg->tof_pitch || cfg->air6_range > 200) {
-        printf("CONFIG VALIDATE: air6_range %d -> %d (must be >= pitch %d and <= 200)\r\n",
-               cfg->air6_range, default_config.air6_range, cfg->tof_pitch);
-        cfg->air6_range = default_config.air6_range;
+    // Air12 范围验证：必须 >= pitch
+    if (cfg->air12_range < cfg->tof_pitch || cfg->air12_range > 255) {
+        printf("CONFIG VALIDATE: air12_range %d -> %d (must be >= pitch %d and <= 255)\r\n",
+               cfg->air12_range, default_config.air12_range, cfg->tof_pitch);
+        cfg->air12_range = default_config.air12_range;
         modified = true;
     }
 
@@ -105,12 +109,60 @@ static bool validate_config(config_t* cfg) {
         modified = true;
     }
 
+    // AIR Overlay 模式验证: 0 或 1
+    if (cfg->air_overlay_enabled > 1) {
+        printf("CONFIG VALIDATE: air_overlay_enabled %d -> %d (invalid, must be 0 or 1)\r\n",
+               cfg->air_overlay_enabled, default_config.air_overlay_enabled);
+        cfg->air_overlay_enabled = default_config.air_overlay_enabled;
+        modified = true;
+    }
+
     return modified;
 }
 
 //==============================================================================
 // API 实现
 //==============================================================================
+
+/**
+ * 设置 barrier mode (在 main.cpp 启动时调用)
+ * 影响默认 touch/release 阈值
+ */
+void config_set_barrier_mode(uint8_t mode) {
+    current_barrier_mode = mode;
+    printf("CONFIG: Barrier mode set to %d\n", mode);
+}
+
+/**
+ * 获取当前 barrier mode
+ */
+uint8_t config_get_barrier_mode() {
+    return current_barrier_mode;
+}
+
+/**
+ * 根据 barrier mode 获取默认 touch 阈值
+ */
+static uint8_t get_default_touch_threshold() {
+    switch (current_barrier_mode) {
+        case 0: return 20;  // Mode 0: Direct contact
+        case 1: return 3;   // Mode 1: Object barrier
+        case 2: return 3;   // Mode 2: Object barrier + glove
+        default: return 20;
+    }
+}
+
+/**
+ * 根据 barrier mode 获取默认 release 阈值
+ */
+static uint8_t get_default_release_threshold() {
+    switch (current_barrier_mode) {
+        case 0: return 18;  // Mode 0: Direct contact
+        case 1: return 2;   // Mode 1: Object barrier
+        case 2: return 2;   // Mode 2: Object barrier + glove
+        default: return 18;
+    }
+}
 
 /**
  * 初始化配置
@@ -139,18 +191,22 @@ void config_init() {
             printf("CONFIG INIT: Parameters corrected after validation\r\n");
         }
 
-        printf("CONFIG LOAD FLASH: touch=%d release=%d offset=%d pitch=%d air6=%d hold=%d\r\n",
+        printf("CONFIG LOAD FLASH: touch=%d release=%d offset=%d pitch=%d air12=%d hold=%d overlay=%d\r\n",
                config_data.touch_threshold, config_data.release_threshold,
                config_data.tof_offset, config_data.tof_pitch,
-               config_data.air6_range, config_data.air_min_hold_ms);
+               config_data.air12_range, config_data.air_min_hold_ms, config_data.air_overlay_enabled);
     } else {
         printf("CONFIG INIT: Flash load failed, using defaults\r\n");
         memcpy(&config_data, &default_config, sizeof(config_data));
 
-        printf("CONFIG LOAD DEFAULT: touch=%d release=%d offset=%d pitch=%d air6=%d hold=%d\r\n",
+        // 根据 runtime barrier mode 设置默认阈值
+        config_data.touch_threshold = get_default_touch_threshold();
+        config_data.release_threshold = get_default_release_threshold();
+
+        printf("CONFIG LOAD DEFAULT: touch=%d release=%d offset=%d pitch=%d air12=%d hold=%d overlay=%d\r\n",
                config_data.touch_threshold, config_data.release_threshold,
                config_data.tof_offset, config_data.tof_pitch,
-               config_data.air6_range, config_data.air_min_hold_ms);
+               config_data.air12_range, config_data.air_min_hold_ms, config_data.air_overlay_enabled);
     }
 
     // 设置全局指针
@@ -171,10 +227,10 @@ bool config_save() {
     }
 
     printf("CONFIG SAVE: Saving current config to Flash...\r\n");
-    printf("CONFIG SAVE: touch=%d release=%d offset=%d pitch=%d air6=%d hold=%d\r\n",
+    printf("CONFIG SAVE: touch=%d release=%d offset=%d pitch=%d air12=%d hold=%d overlay=%d\r\n",
            cfg->touch_threshold, cfg->release_threshold,
            cfg->tof_offset, cfg->tof_pitch,
-           cfg->air6_range, cfg->air_min_hold_ms);
+           cfg->air12_range, cfg->air_min_hold_ms, cfg->air_overlay_enabled);
 
     bool success = save_write(cfg, sizeof(config_t));
 

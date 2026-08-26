@@ -34,11 +34,20 @@
 using namespace Chuni245Tof;
 
 // Physical button pins
-#define BUTTON_ENTER_PIN  18
-#define BUTTON_2_PIN      19
+#define BUTTON_ENTER_PIN  18  // GP18 - Barrier mode 1 selection at startup
+#define BUTTON_2_PIN      19  // GP19 - Barrier mode 0 selection at startup
 
 // Onboard LED
 #define LED_PIN 25
+
+// Barrier mode selection buttons (startup only)
+// 按照用户要求：
+// - 不按按键上电 → 模式 2 (默认)
+// - 按住 GP18 上电 → 模式 1
+// - 按住 GP19 上电 → 模式 0 (优先级最高)
+
+// Runtime barrier mode (determined at startup)
+static uint8_t runtime_barrier_mode = 2;  // Default: mode 2
 
 // NKRO Keyboard report
 struct __attribute__((packed)) {
@@ -242,12 +251,14 @@ static void output_monitor_data() {
     // Slider状态（32 bits）
     printf("  \"slider\": %lu,\r\n", slider_state);
 
-    // AIR 状态
+    // AIR 状态 (12-bit sensor_bitmap + 6-bit hid_bitmap)
     printf("  \"air\": {\r\n");
-    printf("    \"max\": %d,\r\n", air_debug.max_distance);
-    printf("    \"sensor\": %u,\r\n", air_debug.sensor_bitmap);
-    printf("    \"hid\": %u\r\n", air_debug.hid_bitmap);
+    printf("    \"sensor\": %u,\r\n", air_debug.sensor_bitmap);  // 12-bit
+    printf("    \"hid\": %u\r\n", air_debug.hid_bitmap);          // 6-bit
     printf("  },\r\n");
+
+    // Overlay 状态
+    printf("  \"overlay\": %d,\r\n", cfg->air_overlay_enabled);
 
     // TOF 传感器数据
     printf("  \"tof\": [\r\n");
@@ -275,11 +286,11 @@ static void output_monitor_data() {
 
 // CDC command handler
 static void cdc_process_command(const char* cmd) {
-    // Parse CONFIG command: CONFIG touch release offset pitch air6_range min_hold
+    // Parse CONFIG command: CONFIG touch release offset pitch [air12_range] [min_hold] [overlay]
     if (strncmp(cmd, "CONFIG ", 7) == 0) {
-        int touch, release, offset, pitch, air6_range, min_hold;
-        int num_args = sscanf(cmd + 7, "%d %d %d %d %d %d",
-                             &touch, &release, &offset, &pitch, &air6_range, &min_hold);
+        int touch, release, offset, pitch, air12_range, min_hold, overlay;
+        int num_args = sscanf(cmd + 7, "%d %d %d %d %d %d %d",
+                             &touch, &release, &offset, &pitch, &air12_range, &min_hold, &overlay);
 
         if (num_args >= 4) {  // 至少 4 个参数
             // 阈值范围已解除限制，允许调试
@@ -299,26 +310,30 @@ static void cdc_process_command(const char* cmd) {
             if (pitch >= 4 && pitch <= 100) {
                 cfg->tof_pitch = pitch;
             }
-            // Air6 range (可选，默认 150)
-            if (num_args >= 5 && air6_range >= pitch && air6_range <= 200) {
-                cfg->air6_range = air6_range;
+            // Air12 range (可选，默认 150)
+            if (num_args >= 5 && air12_range >= pitch && air12_range <= 255) {
+                cfg->air12_range = air12_range;
             }
             // Min hold time (可选，默认 100)
             if (num_args >= 6 && min_hold >= 10 && min_hold <= 500) {
                 cfg->air_min_hold_ms = min_hold;
             }
+            // Overlay mode (可选，默认 1)
+            if (num_args >= 7 && (overlay == 0 || overlay == 1)) {
+                cfg->air_overlay_enabled = overlay;
+            }
 
-            printf("OK touch=%d release=%d offset=%d pitch=%d air6=%d hold=%d\r\n",
+            printf("OK touch=%d release=%d offset=%d pitch=%d air12=%d hold=%d overlay=%d\r\n",
                    cfg->touch_threshold, cfg->release_threshold,
-                   cfg->tof_offset, cfg->tof_pitch, cfg->air6_range, cfg->air_min_hold_ms);
+                   cfg->tof_offset, cfg->tof_pitch, cfg->air12_range, cfg->air_min_hold_ms, cfg->air_overlay_enabled);
         } else {
-            printf("ERROR Usage: CONFIG touch release offset pitch [air6_range] [min_hold]\r\n");
+            printf("ERROR Usage: CONFIG touch release offset pitch [air12_range] [min_hold] [overlay]\r\n");
         }
     }
     else if (strcmp(cmd, "CONFIG?") == 0) {
-        printf("CONFIG touch=%d release=%d offset=%d pitch=%d air6=%d hold=%d\r\n",
+        printf("CONFIG touch=%d release=%d offset=%d pitch=%d air12=%d hold=%d overlay=%d\r\n",
                cfg->touch_threshold, cfg->release_threshold,
-               cfg->tof_offset, cfg->tof_pitch, cfg->air6_range, cfg->air_min_hold_ms);
+               cfg->tof_offset, cfg->tof_pitch, cfg->air12_range, cfg->air_min_hold_ms, cfg->air_overlay_enabled);
     }
     else if (strcmp(cmd, "SAVE") == 0) {
         if (config_save()) {
@@ -330,22 +345,55 @@ static void cdc_process_command(const char* cmd) {
     else if (strcmp(cmd, "DEFAULT") == 0) {
         // Reset to default values (does NOT save to Flash)
         // To persist defaults, user must call SAVE after DEFAULT
-        cfg->touch_threshold = MPR121_DEFAULT_TOUCH_THRESHOLD;
-        cfg->release_threshold = MPR121_DEFAULT_RELEASE_THRESHOLD;
+        // Use runtime barrier mode for default thresholds
+        uint8_t current_mode = config_get_barrier_mode();
+        uint8_t default_touch, default_release;
+
+        // 根据 barrier mode 设置默认阈值（严格匹配 mpr121.h 定义）
+        if (current_mode == 0) {
+            default_touch = 20;
+            default_release = 18;
+        } else {
+            // Mode 1 和 Mode 2 都使用 3/2
+            default_touch = 3;
+            default_release = 2;
+        }
+
+        cfg->touch_threshold = default_touch;
+        cfg->release_threshold = default_release;
         cfg->tof_offset = 120;
         cfg->tof_pitch = 30;
-        cfg->air6_range = 150;
+        cfg->air12_range = 150;
         cfg->air_min_hold_ms = 100;
-        mpr121_set_thresholds(MPR121_DEFAULT_TOUCH_THRESHOLD, MPR121_DEFAULT_RELEASE_THRESHOLD);
-        printf("DEFAULT OK touch=%d release=%d offset=120 pitch=30 air6=150 hold=100\r\n",
-               MPR121_DEFAULT_TOUCH_THRESHOLD, MPR121_DEFAULT_RELEASE_THRESHOLD);
+        cfg->air_overlay_enabled = 1;  // Default: Overlay ON
+        mpr121_set_thresholds(default_touch, default_release);
+
+        printf("DEFAULT OK barrier_mode=%d touch=%d release=%d offset=120 pitch=30 air12=150 hold=100 overlay=1\r\n",
+               current_mode, default_touch, default_release);
         printf("NOTE: Defaults applied to RAM. Use SAVE to persist to Flash.\r\n");
     }
     else if (strcmp(cmd, "STATUS") == 0) {
         // 增强的 STATUS 输出
+        air_debug_data_t air_debug = air_get_debug_data();
+
         printf("{\r\n");
         printf("  \"slider\": \"0x%08lX\",\r\n", slider_get_state());
-        printf("  \"air\": \"0x%02X\",\r\n", air_get_bitmap());
+        printf("  \"air\": \"0x%03X\",\r\n", air_get_air_state());  // 12-bit
+        printf("  \"air_hid\": \"0x%02X\",\r\n", air_get_bitmap()); // 6-bit HID
+        printf("  \"overlay\": %d,\r\n", cfg->air_overlay_enabled);
+        printf("  \"barrier_mode\": %d,\r\n", config_get_barrier_mode());
+
+        // 添加 TOF 传感器数据
+        printf("  \"tof\": [\r\n");
+        for (int i = 0; i < 5; i++) {
+            printf("    {\"d\": %d, \"a\": %lu, \"v\": %d}%s\r\n",
+                   air_debug.sensor_distances[i],
+                   air_debug.sensor_ages[i],
+                   air_debug.sensor_valid[i] ? 1 : 0,
+                   (i < 4) ? "," : "");
+        }
+        printf("  ],\r\n");
+
         printf("  \"perf\": {\r\n");
         printf("    \"loop_avg_us\": %lu,\r\n", main_loop_avg_us);
         printf("    \"loop_max_us\": %lu,\r\n", main_loop_max_us);
@@ -368,9 +416,10 @@ static void cdc_process_command(const char* cmd) {
         air_debug_data_t debug = air_get_debug_data();
         printf("AIR Debug:\r\n");
         printf("  max_dist: %d mm\r\n", debug.max_distance);
-        printf("  sensor_bmp: 0x%02X (", debug.sensor_bitmap);
-        for (int i = 0; i < 6; i++) {
+        printf("  sensor_bmp: 0x%03X (", debug.sensor_bitmap);
+        for (int i = 0; i < 12; i++) {
             printf("%d", (debug.sensor_bitmap >> i) & 1);
+            if (i == 5) printf(" ");  // Separate AIR1-6 and AIR7-12
         }
         printf(")\r\n");
         printf("  hid_bmp: 0x%02X (", debug.hid_bitmap);
@@ -532,31 +581,70 @@ int main(void) {
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 1);
 
-    // Initialize physical buttons
-    gpio_init(BUTTON_ENTER_PIN);
+    // ===== BARRIER MODE SELECTION (before any other initialization) =====
+    // 初始化 GP18 和 GP19 用于启动时检测
+    gpio_init(BUTTON_ENTER_PIN);  // GP18
     gpio_set_dir(BUTTON_ENTER_PIN, GPIO_IN);
     gpio_pull_up(BUTTON_ENTER_PIN);
 
-    gpio_init(BUTTON_2_PIN);
+    gpio_init(BUTTON_2_PIN);      // GP19
     gpio_set_dir(BUTTON_2_PIN, GPIO_IN);
     gpio_pull_up(BUTTON_2_PIN);
+
+    // 等待 pull-up 稳定 (RP2040 内部 pull-up 约 50kΩ，需要时间充电线路电容)
+    busy_wait_us(100);
+
+    // 读取按键状态（active low）
+    bool gp18_pressed = !gpio_get(BUTTON_ENTER_PIN);  // 按住 GP18 → 模式 1
+    bool gp19_pressed = !gpio_get(BUTTON_2_PIN);      // 按住 GP19 → 模式 0
+
+    // 确定 barrier mode（GP19 优先级高于 GP18）
+    if (gp19_pressed) {
+        runtime_barrier_mode = 0;  // Mode 0: 直接接触
+    } else if (gp18_pressed) {
+        runtime_barrier_mode = 1;  // Mode 1: 物体间隔
+    } else {
+        runtime_barrier_mode = 2;  // Mode 2: 物体间隔+手套 (默认)
+    }
 
     printf("\n========================================\n");
     printf("   Chuni245Tof Controller\r\n");
     printf("   Optimized for High-Speed Air Detection\r\n");
-    printf("========================================\n\n");
+    printf("========================================\n");
+
+    // Print barrier mode selection
+    printf("\n[STARTUP] Barrier Mode Selection:\n");
+    printf("  GP18: %s, GP19: %s\n",
+           gp18_pressed ? "PRESSED" : "released",
+           gp19_pressed ? "PRESSED" : "released");
+    printf("  Selected Mode: %d", runtime_barrier_mode);
+    if (runtime_barrier_mode == 0) {
+        printf(" (Direct contact - Touch=20 Release=18 CONFIG1=0x35 CONFIG2=0x02)\n");
+    } else if (runtime_barrier_mode == 1) {
+        printf(" (Object barrier - Touch=3 Release=2 CONFIG1=0x35 CONFIG2=0x22)\n");
+    } else {
+        printf(" (Object barrier + glove - Touch=3 Release=2 CONFIG1=0x25 CONFIG2=0x22)\n");
+    }
+    printf("\n");
 
     tusb_init();
 
     static mutex_t lock;
     mutex_init(&lock);
 
+    // ===== Set barrier mode before config_init =====
+    // This affects default touch/release thresholds and MPR121 CONFIG registers
+    config_set_barrier_mode(runtime_barrier_mode);
+
+    // ===== Initialize configuration =====
+    // This will load from Flash or use defaults
+    // The defaults will use runtime_barrier_mode for touch/release thresholds
     config_init();
     save_init(0xCA34CAFE, &lock);
 
     printf("Initializing sensors...\r\n");
     button_init();
-    slider_init();
+    slider_init();  // This will call mpr121_init() with barrier mode settings
 #if DEBUG_MPR121
     mpr121_debug_init();  // one-shot config dump after MPR121 init
 #endif

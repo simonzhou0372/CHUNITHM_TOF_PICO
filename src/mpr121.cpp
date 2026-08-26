@@ -45,6 +45,12 @@
  *   错误做法：if (delta < -touch_threshold) touched = true;
  *   正确做法：使用 MPR121_TOUCHSTATUS 寄存器（已由硬件完成判定）
  *
+ * 【Barrier Mode 运行时选择】
+ *   - Mode 0: 直接接触模式 (Touch=20, Release=18, CONFIG1=0x35, CONFIG2=0x02)
+ *   - Mode 1: 物体间隔模式 (Touch=3, Release=2, CONFIG1=0x35, CONFIG2=0x22)
+ *   - Mode 2: 物体间隔+手套模式 (Touch=3, Release=2, CONFIG1=0x25, CONFIG2=0x22)
+ *   - 由 config_get_barrier_mode() 在运行时确定
+ *
  * ==============================================================================
  */
 
@@ -161,72 +167,66 @@ static bool mpr_init_single(uint8_t addr, int index) {
         return false;
     }
 
-    // Set touch/release thresholds for all 12 channels
-    // 使用 mpr121.h 中定义的默认阈值
-    uint8_t touch_thr = cfg ? cfg->touch_threshold : MPR121_DEFAULT_TOUCH_THRESHOLD;
-    uint8_t release_thr = cfg ? cfg->release_threshold : MPR121_DEFAULT_RELEASE_THRESHOLD;
+    // ===== BARRIER MODE 配置 (运行时确定) =====
+    uint8_t barrier_mode = config_get_barrier_mode();
 
+    // 根据 barrier mode 设置 Touch/Release 阈值和 CONFIG1/CONFIG2
+    uint8_t touch_thr, release_thr;
+    uint8_t config1, config2;
+
+    switch (barrier_mode) {
+        case 0: // Mode 0: 直接接触
+            touch_thr = 20; release_thr = 18;
+            config1 = 0x35; config2 = 0x02;
+            break;
+        case 1: // Mode 1: 物体间隔
+            touch_thr = 3; release_thr = 2;
+            config1 = 0x35; config2 = 0x22;
+            break;
+        case 2: // Mode 2: 物体间隔+手套
+        default:
+            touch_thr = 3; release_thr = 2;
+            config1 = 0x25; config2 = 0x22;
+            break;
+    }
+
+    // 如果 cfg 已初始化，使用 Flash 中的用户配置
+    if (cfg) {
+        touch_thr = cfg->touch_threshold;
+        release_thr = cfg->release_threshold;
+    }
+
+    // 写入阈值
     for (int i = 0; i < 12; i++) {
         mpr_write_byte(addr, MPR121_TOUCHTH_L + i * 2, touch_thr);
         mpr_write_byte(addr, MPR121_RELEASETH_L + i * 2, release_thr);
     }
 
-    // Filter configuration 
-    // Rising filter 
+    // Filter configuration
     mpr_write_byte(addr, MPR121_MHDR, 0x01);
     mpr_write_byte(addr, MPR121_NHDR, 0x01);
     mpr_write_byte(addr, MPR121_NCLR, 0x0E);
     mpr_write_byte(addr, MPR121_FDLR, 0x00);
-
-    // Falling filter
     mpr_write_byte(addr, MPR121_MHDF, 0x01);
     mpr_write_byte(addr, MPR121_NHDF, 0x05);
     mpr_write_byte(addr, MPR121_NCLF, 0x01);
     mpr_write_byte(addr, MPR121_FDLF, 0x00);
-
-    // Touch filter (触摸检测滤波)
     mpr_write_byte(addr, MPR121_NHDT, 0x00);
     mpr_write_byte(addr, MPR121_NCLT, 0x00);
     mpr_write_byte(addr, MPR121_FDLT, 0x00);
-
-    // Debounce = 0 (无去抖，最低延迟)
     mpr_write_byte(addr, MPR121_DEBOUNCE, 0x00);
 
-/*
-CDT 编码 (二进制)	CDT 值 (十进制)	充电/放电时间	CONFIG2 十六进制
-000	0	0.5 µs (默认)	0x02
-001	1	1 µs	0x22
-010	2	2 µs	0x42
-011	3	4 µs	0x62
-100	4	8 µs	0x82
-101	5	16 µs	0xA2
-110	6	32 µs	0xC2
-111	7	64 µs (最大值)	0xE2
-*/
-#if MPR121_TOUCH_BARRIER_MODE == 1
-    // CONFIG1 和 CONFIG2
-    mpr_write_byte(addr, MPR121_CONFIG1, 0x35);
-    mpr_write_byte(addr, MPR121_CONFIG2, 0x22);
-#elif MPR121_TOUCH_BARRIER_MODE == 2
-    // CONFIG1 和 CONFIG2
-    mpr_write_byte(addr, MPR121_CONFIG1, 0x25);
-    mpr_write_byte(addr, MPR121_CONFIG2, 0x22);
-#else
-    // CONFIG1 和 CONFIG2
-    mpr_write_byte(addr, MPR121_CONFIG1, 0x35);
-    mpr_write_byte(addr, MPR121_CONFIG2, 0x02);
-#endif
-    // 不使用 Auto-Configuration
-    // 让 Baseline 自然稳定即可
+    // 写入 CONFIG1/CONFIG2
+    mpr_write_byte(addr, MPR121_CONFIG1, config1);
+    mpr_write_byte(addr, MPR121_CONFIG2, config2);
 
-    // Enable electrodes - 12 electrodes
-    // ECR: 0x80 (enable) | 12 (electrodes)
+    // Enable electrodes
     mpr_write_byte(addr, MPR121_ECR, 0x8C);
-
-    // 等待 Baseline 稳定
     sleep_ms(100);
 
-    printf("OK (THR=%d/%d)\n", touch_thr, release_thr);
+    // 一行输出所有关键信息
+    printf("OK (BMode=%d THR=%d/%d CFG=0x%02X/0x%02X)\n",
+           barrier_mode, touch_thr, release_thr, config1, config2);
     return true;
 }
 
