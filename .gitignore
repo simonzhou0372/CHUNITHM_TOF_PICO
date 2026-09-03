@@ -1,6 +1,7 @@
 build
 .vscode
 .claude
+.ref
 *.exe
 *.zip
 tools/__pycache__
