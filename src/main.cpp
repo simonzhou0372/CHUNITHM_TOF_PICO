@@ -654,8 +654,9 @@ int main(void) {
 #if DEBUG_MPR121
     mpr121_debug_init();  // one-shot config dump after MPR121 init
 #endif
-    vl53l0x_init();  // 先初始化 VL53L0X
-    air_init();      // 再启动 Core 1 读取任务
+    // I2C1 由 Core1 独占: VL53L0X 初始化与轮询全部在 Core1 上执行
+    // (air_init → tof_reader_init → Core1 启动 vl53l0x_init)
+    air_init();      // 启动 Core 1 读取任务（含 I2C1 + VL53L0X 初始化）
     printf("Ready.\r\n\n");
 
     printf("Commands: STATUS, AIRDEBUG, PERF, DIST, AIR, HELP\r\n\n");
