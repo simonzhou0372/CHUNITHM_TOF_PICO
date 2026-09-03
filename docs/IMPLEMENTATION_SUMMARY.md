@@ -6,6 +6,106 @@
 
 ---
 
+## 重大架构更新 (2026-08-29)
+
+### Per-TOF 独立 AIR 检测架构
+
+**核心改变**：彻底移除"5 个 TOF 取最大距离决定 AIR 层"的旧架构，改为每个 TOF 独立检测 AIR 层。
+
+#### 旧架构问题
+
+```
+5 个 TOF → 取 max_distance → 单一距离决定 AIR 层
+```
+
+问题：
+- 只能产生一个 AIR layer
+- 一个 TOF 的距离会覆盖其他 TOF 的有效 AIR 状态
+- 无法表示"多个 TOF 同时处于不同高度"的真实情况
+
+#### 新架构
+
+```
+┌─────────┐
+│  TOF 1  │ ──→ 独立计算 AIR layer (带 hysteresis)
+├─────────┤
+│  TOF 2  │ ──→ 独立计算 AIR layer (带 hysteresis)
+├─────────┤
+│  TOF 3  │ ──→ 独立计算 AIR layer (带 hysteresis)
+├─────────┤
+│  TOF 4  │ ──→ 独立计算 AIR layer (带 hysteresis)
+├─────────┤
+│  TOF 5  │ ──→ 独立计算 AIR layer (带 hysteresis)
+└─────────┘
+      │
+      ▼
+  OR 合并
+      │
+      ▼
+  12-bit AIR bitmap
+      │
+      ▼
+  HID OR 映射 (AIR1||AIR7 → key1, etc.)
+      │
+      ▼
+  min_hold 处理
+      │
+      ▼
+  6-bit HID output
+```
+
+#### 关键数据结构
+
+```c
+// 每个 TOF 当前所在的 AIR layer
+static uint8_t sensor_active_layer[5];  // 0~11 = AIR1~AIR12, 0xFF = 无效
+
+// AIR 状态 (12-bit bitmap)
+static uint16_t air_state;  // bit0=AIR1, ..., bit11=AIR12
+
+// HID 输出 (6-bit)
+static uint8_t hid_air_bitmap;  // bit0=key1, ..., bit5=key6
+```
+
+#### 核心函数
+
+```c
+// 计算距离对应的 AIR layer
+static uint8_t calculate_air_layer(distance, offset, pitch, air12_range, num_layers);
+
+// 使用 hysteresis 更新单个 TOF 的 AIR layer
+static uint8_t update_sensor_air_layer(sensor_idx, distance, ...);
+```
+
+#### Hysteresis 改为 Per-TOF
+
+每个 TOF 独立维护 hysteresis 状态，互不干扰：
+
+```c
+// TOF1 的 hysteresis 只影响 TOF1
+// TOF2 的 hysteresis 只影响 TOF2
+// ...
+```
+
+#### max_distance 仅用于调试
+
+```c
+// 不再参与 AIR 判定！
+current_max_distance = max_dist_for_debug;  // 仅用于 GUI/调试显示
+```
+
+#### 验证场景
+
+| 场景 | TOF 状态 | 预期结果 |
+|-----|---------|---------|
+| 多 TOF 同层 | TOF1=AIR1, TOF2=AIR1, TOF3=AIR1 | AIR1=ON, key1=ON |
+| 多 TOF 不同层 | TOF1=AIR1, TOF2=AIR2, TOF3=AIR3 | AIR1~AIR3=ON, key1~key3=ON |
+| Overlay 映射 | TOF1=AIR1, TOF2=AIR7 | AIR1=ON, AIR7=ON, key1=ON |
+| AIR1 OFF, AIR7 ON | AIR1=OFF, AIR7=ON | key1 继续 ON |
+| TOF 无效不影响其他 | TOF1=invalid, TOF2=AIR2 | AIR2=ON, key2=ON |
+
+---
+
 ## 一、修改的文件列表
 
 ### 1. 固件代码
