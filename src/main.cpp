@@ -415,7 +415,7 @@ static void cdc_process_command(const char* cmd) {
         // 输出 AIR 调试数据
         air_debug_data_t debug = air_get_debug_data();
         printf("AIR Debug:\r\n");
-        printf("  max_dist: %d mm\r\n", debug.max_distance);
+        printf("  max_dist: %d mm (debug only)\r\n", debug.max_distance);
         printf("  sensor_bmp: 0x%03X (", debug.sensor_bitmap);
         for (int i = 0; i < 12; i++) {
             printf("%d", (debug.sensor_bitmap >> i) & 1);
@@ -427,11 +427,17 @@ static void cdc_process_command(const char* cmd) {
             printf("%d", (debug.hid_bitmap >> i) & 1);
         }
         printf(")\r\n");
-        printf("  sensors:\r\n");
+        printf("  Per-TOF AIR layers:\r\n");
         for (int i = 0; i < 5; i++) {
-            printf("    TOF%d: dist=%d mm, age=%lu ms, valid=%d\r\n",
-                   i + 1, debug.sensor_distances[i],
-                   debug.sensor_ages[i], debug.sensor_valid[i]);
+            int layer = debug.sensor_air_layer[i];
+            printf("    TOF%d: dist=%d mm, age=%lu ms, valid=%d, layer=%s\r\n",
+                   i + 1, debug.sensor_distances[i], debug.sensor_ages[i],
+                   debug.sensor_valid[i] ? 1 : 0,
+                   (layer == 0xFF) ? "NONE" : (layer < 12 ? "AIR?" : "?"));
+            if (layer < 12) {
+                // 打印 AIR 层名称
+                printf("         → AIR%d\r\n", layer + 1);
+            }
         }
     }
     else if (strcmp(cmd, "PERF") == 0) {

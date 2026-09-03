@@ -27,13 +27,14 @@ void air_set_threshold(uint8_t sensor, uint16_t threshold_mm);
 
 // 获取调试数据
 typedef struct {
-    uint16_t max_distance;       // 当前最大距离
-    uint16_t sensor_bitmap;      // 传感器原始状态 (12-bit: AIR1~AIR12)
-    uint8_t hid_bitmap;          // HID 输出状态 (6-bit: key1~key6)
-    uint32_t timestamp_us;       // 更新时间戳
+    uint16_t max_distance;        // 当前最大距离 (仅用于调试，不参与 AIR 判定)
+    uint16_t sensor_bitmap;       // AIR 状态 (12-bit: AIR1~AIR12)
+    uint8_t hid_bitmap;           // HID 输出状态 (6-bit: key1~key6)
+    uint32_t timestamp_us;        // 更新时间戳
     uint16_t sensor_distances[5]; // 各传感器距离
-    uint32_t sensor_ages[5];     // 各传感器数据年龄
-    bool sensor_valid[5];        // 各传感器数据有效性
+    uint32_t sensor_ages[5];      // 各传感器数据年龄
+    bool sensor_valid[5];         // 各传感器数据有效性
+    uint8_t sensor_air_layer[5];  // 各传感器当前 AIR layer (0~11 = AIR1~AIR12, 0xFF = 无效)
 } air_debug_data_t;
 
 air_debug_data_t air_get_debug_data();
