@@ -107,6 +107,7 @@ static uint8_t stop_variable[5] = { 0 };
 static volatile uint32_t i2c_error_count[5] = { 0 };
 static volatile uint32_t consecutive_errors[5] = { 0 };
 static volatile uint32_t last_new_data_ms[5] = { 0 };
+static volatile uint32_t last_comm_ok_ms[5] = { 0 };
 static volatile uint32_t recovery_count[5] = { 0 };
 
 // 最后一次有效距离（按传感器缓存）
@@ -209,6 +210,13 @@ static void record_comm_error(uint8_t index)
 {
     i2c_error_count[index]++;
     consecutive_errors[index]++;
+}
+
+// 记录一次成功的通信（任何寄存器读成功都证明 总线+传感器 仍可访问）
+// 与 last_new_data_ms 分开: 前者度量 "通信层存活", 后者度量 "测距流水线产出"
+static inline void stamp_comm_ok(uint8_t index)
+{
+    last_comm_ok_ms[index] = to_ms_since_boot(get_absolute_time());
 }
 
 // 检查传感器在指定地址响应且型号正确 (MODEL_ID = 0xEE)
@@ -740,9 +748,11 @@ void vl53l0x_init(void)
 
         if (init_sensor(i)) {
             sensor_ready[i] = true;
-            // 数据时间基准从初始化成功时刻开始计时
+            // 数据/通信时间基准从初始化成功时刻开始计时
             // (防止 5 颗总初始化时间超过 no-data 阈值时误触发恢复)
-            last_new_data_ms[i] = to_ms_since_boot(get_absolute_time());
+            uint32_t now = to_ms_since_boot(get_absolute_time());
+            last_new_data_ms[i] = now;
+            last_comm_ok_ms[i] = now;
         } else {
             sensor_ready[i] = false;
             health_override[i] = HO_OFFLINE;
@@ -772,7 +782,9 @@ bool vl53l0x_recover_sensor(uint8_t index)
         sensor_ready[index] = true;
         health_override[index] = HO_NONE;
         consecutive_errors[index] = 0;
-        last_new_data_ms[index] = to_ms_since_boot(get_absolute_time());
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        last_new_data_ms[index] = now;
+        last_comm_ok_ms[index] = now;
         return true;
     }
 
@@ -873,7 +885,9 @@ bool vl53l0x_reinit_all(void)
         if (init_sensor(i)) {
             sensor_ready[i] = true;
             health_override[i] = HO_NONE;
-            last_new_data_ms[i] = to_ms_since_boot(get_absolute_time());
+            uint32_t now = to_ms_since_boot(get_absolute_time());
+            last_new_data_ms[i] = now;
+            last_comm_ok_ms[i] = now;
         } else {
             sensor_ready[i] = false;
             health_override[i] = HO_OFFLINE;
@@ -891,6 +905,24 @@ void vl53l0x_force_offline(uint8_t index)
     if (index >= 5) return;
     sensor_ready[index] = false;
     health_override[index] = HO_RECOVERING;
+}
+
+// 存活探测（不改变任何配置, 不产生测距动作）:
+// 总线级恢复后用于甄别 —— 响应的传感器原样保留继续测距,
+// 无响应的传感器才进入各自的 XSHUT 恢复路径。
+// 探测成功时刷新通信时间戳并清零连续错误 (供掉线判定使用)。
+bool vl53l0x_probe_sensor(uint8_t index)
+{
+    if (index >= 5 || !sensor_ready[index]) return false;
+
+    if (!check_model_id(sensor_addr[index])) {
+        record_comm_error(index);
+        return false;
+    }
+
+    stamp_comm_ok(index);
+    consecutive_errors[index] = 0;
+    return true;
 }
 
 //==============================================================================
@@ -911,7 +943,14 @@ vl53l0x_read_result_t vl53l0x_read_distance_ex(uint8_t index, uint16_t *distance
         return VL53L0X_READ_COMM_ERROR;    // 通信失败: 不返回任何数据
     }
 
+    // 状态寄存器读取成功 = 通信层存活（与是否产出数据无关）
+    stamp_comm_ok(index);
+
     if ((status & 0x07) == 0) {
+        // 测量进行中 —— 这次成功的通信同时证明传感器没有失联,
+        // 连续通信错误计数在此清零（"连续失败"必须是连续的通信失败,
+        // 不能把夹杂着成功通信的错误序列累加成掉线依据）
+        consecutive_errors[index] = 0;
         return VL53L0X_READ_NOT_READY;     // 测量进行中（通信正常）
     }
 
@@ -966,8 +1005,10 @@ bool vl53l0x_has_new_data(uint8_t index)
 
     uint8_t status;
     if (!read_reg(sensor_addr[index], REG_RESULT_INTERRUPT_STATUS, &status)) {
+        record_comm_error(index);
         return false;
     }
+    stamp_comm_ok(index);
     return (status & 0x07) != 0;
 }
 
@@ -1006,6 +1047,14 @@ uint32_t vl53l0x_get_last_new_data_ms(uint8_t index)
 {
     if (index >= 5) return 0;
     return last_new_data_ms[index];
+}
+
+// 最后一次成功通信（任何寄存器读取成功）的时间戳 (ms)
+// 与 last_new_data 的区别: 传感器 "应答但不产出数据" 时, comm 刷新而 data 停滞
+uint32_t vl53l0x_get_last_comm_ok_ms(uint8_t index)
+{
+    if (index >= 5) return 0;
+    return last_comm_ok_ms[index];
 }
 
 uint32_t vl53l0x_get_recovery_count(uint8_t index)

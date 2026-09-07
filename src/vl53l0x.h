@@ -4,8 +4,10 @@
  * 可靠性架构:
  * - TimingBudget 统一配置源: VL53L0X_TIMING_BUDGET_US = 20000us (20ms)
  * - 完整的初始化错误检查（所有关键 I2C 写入都必须成功）
- * - 单传感器 XSHUT 恢复（与冷启动完全相同的初始化路径）
- * - I2C1 总线恢复（9-clock + STOP + 外设重新初始化）
+ * - 单传感器 XSHUT 恢复（与冷启动完全相同的初始化路径, 只操作目标传感器）
+ * - I2C1 总线恢复（9-clock + STOP + 外设重新初始化, 不动 XSHUT/配置）
+ * - 恢复分级: 瞬时错误容忍 → 单传感器恢复 → 总线恢复+存活甄别 → 全量重初始化
+ *   (全量重初始化仅在总线恢复失败时作为最后手段)
  * - Sensor Health 状态机
  * - 所有总线操作只能在 Core1 执行（I2C1 由 Core1 独占）
  */
@@ -64,6 +66,12 @@ bool vl53l0x_reinit_all(void);
 // 仅供 Core1 恢复状态机使用
 void vl53l0x_force_offline(uint8_t index);
 
+// 存活探测: 读取 MODEL_ID 验证传感器在总线上仍可访问, 不改变任何配置。
+// 供总线恢复后的分级甄别使用: 响应者原样保留继续测距,
+// 无响应者才进入单传感器 XSHUT 恢复。
+// 探测成功时刷新通信时间戳并清零连续错误计数。
+bool vl53l0x_probe_sensor(uint8_t index);
+
 // 注册让出回调: 初始化/恢复的长等待期间 (XSHUT 复位 / SPAD 查询 / 参考校准)
 // 驱动会周期性调用该回调, 由 tof_reader 继续轮询健康传感器,
 // 保证单传感器恢复期间其他 4 个传感器的数据不超龄 (50ms)
@@ -98,11 +106,15 @@ vl53l0x_health_t vl53l0x_get_health(uint8_t index);
 // 累计 I2C 错误计数（自启动/恢复以来）
 uint32_t vl53l0x_get_error_count(uint8_t index);
 
-// 连续通信错误计数（成功读取新数据时清零）
+// 连续通信错误计数（任何成功的通信 —— 含 NOT_READY 轮询 —— 都会清零）
 uint32_t vl53l0x_get_consecutive_errors(uint8_t index);
 
 // 最后一次成功读取新数据的时间戳 (ms)
 uint32_t vl53l0x_get_last_new_data_ms(uint8_t index);
+
+// 最后一次成功通信的时间戳 (ms) —— 任何寄存器读取成功都算。
+// 区分 "通信层失联"（comm 停滞）与 "测距卡死"（comm 正常但 data 停滞）
+uint32_t vl53l0x_get_last_comm_ok_ms(uint8_t index);
 
 // 恢复次数统计
 uint32_t vl53l0x_get_recovery_count(uint8_t index);
