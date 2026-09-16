@@ -28,6 +28,7 @@
 #include "slider.h"
 #include "vl53l0x.h"
 #include "tof_reader.h"
+#include "tof_events.h"
 #include "air.h"
 #include "button.h"
 
@@ -60,6 +61,15 @@ static volatile bool hid_dirty = false;  // 状态变化标志
 static volatile uint64_t last_hid_send_time = 0;  // 上次发送时间
 static volatile uint32_t hid_send_count = 0;  // HID 发送计数
 
+// USB 活跃性统计（区分 "CPU 卡住" 与 "USB/电源层掉线" 的关键观测点）
+static volatile uint64_t last_tud_task_us = 0;       // 上次 tud_task() 调用时刻
+static volatile uint32_t max_tud_task_interval_us = 0;  // 两次 tud_task() 之间的最大间隔
+static volatile uint32_t tud_task_count = 0;
+static volatile uint32_t hid_ready_false_count = 0;  // HID endpoint busy 次数
+static volatile uint64_t hid_busy_since_us = 0;      // 连续 not-ready 起点 (0 = endpoint ready)
+static volatile uint32_t max_hid_not_ready_us = 0;   // 连续 not-ready 最长持续时间
+static volatile uint32_t max_hid_send_gap_us = 0;    // 两次成功 HID 发送的最大间隔
+
 // 性能统计
 static volatile uint32_t main_loop_count = 0;
 static volatile uint32_t main_loop_max_us = 0;
@@ -70,6 +80,8 @@ static volatile uint64_t main_loop_last_time = 0;
 static volatile bool monitor_mode = false;
 static volatile uint32_t monitor_interval_ms = 100;
 static volatile uint64_t last_monitor_time = 0;
+static volatile uint32_t monitor_truncated_count = 0; // CDC 背压导致被截断的 monitor 输出次数
+static volatile uint32_t cdc_cmd_dropped_count = 0;   // CDC 背压导致被丢弃的命令条数
 
 static char cdc_rx_buf[256];
 static uint8_t cdc_rx_pos = 0;
@@ -204,37 +216,69 @@ static void gen_nkro_report() {
 
 // Send HID report
 static void report_usb_hid() {
-    // 检查 USB 是否就绪
+    uint64_t now = time_us_64();
+
+    // 检查 USB 是否就绪（非阻塞 —— busy 时保持 dirty 标志, 状态继续更新,
+    // endpoint 恢复后立即发送最新状态; 同时统计 busy 持续时间以识别
+    // "endpoint 长期卡死" 而不是无限默默等待）
     if (!tud_hid_n_ready(0)) {
-        return;  // USB 未就绪，不发送，但保持 dirty 标志
+        hid_ready_false_count++;
+        if (hid_busy_since_us == 0) {
+            hid_busy_since_us = now;
+        }
+        uint32_t busy_us = (uint32_t)(now - hid_busy_since_us);
+        if (busy_us > max_hid_not_ready_us) {
+            max_hid_not_ready_us = busy_us;
+        }
+        return;
     }
+    hid_busy_since_us = 0;   // 连续 busy 结束
 
     // 检查是否有状态变化
     bool state_changed = (memcmp(&hid_nkro, &sent_hid_nkro, sizeof(hid_nkro)) != 0);
 
-    if (state_changed) {
-        // 状态变化，立即发送
+    if (state_changed || hid_dirty) {
+        // 状态变化立即发送; 或之前因 USB busy 延迟发送, 现在重试
         if (tud_hid_n_report(0, 0, &hid_nkro, sizeof(hid_nkro))) {
+            uint32_t gap_us = (uint32_t)(now - last_hid_send_time);
+            if (last_hid_send_time && gap_us > max_hid_send_gap_us) {
+                max_hid_send_gap_us = gap_us;
+            }
             sent_hid_nkro = hid_nkro;
             hid_dirty = false;
-            last_hid_send_time = time_us_64();
-            hid_send_count++;
-        }
-    } else if (hid_dirty) {
-        // 之前因 USB busy 延迟发送，现在重试
-        if (tud_hid_n_report(0, 0, &hid_nkro, sizeof(hid_nkro))) {
-            sent_hid_nkro = hid_nkro;
-            hid_dirty = false;
-            last_hid_send_time = time_us_64();
+            last_hid_send_time = now;
             hid_send_count++;
         }
     }
     // 如果状态未变化且没有 dirty，不发送（节省带宽）
 }
 
+// ==============================================================================
+// CDC 背压控制 (HID 是实时通道, CDC 是调试通道 —— CDC 绝不能阻塞 HID)
+//
+// stdio 的 USB CDC 后端在 "串口已连接但主机停止读取" 时, printf 会持续重试
+// 写入直到 500ms 超时 —— 对实时 HID 是致命的。策略:
+//   1. 长输出 (monitor JSON / ToF 事件) 先整体构建到缓冲区, 再按小块发送;
+//   2. 每块发送前检查 tud_cdc_n_write_available —— 空间不足立即放弃本轮
+//      剩余输出 (计数并跳过), 绝不等待;
+//   3. 主机未连接 (DTR 断开) 时 stdio 本身不输出, 无阻塞。
+// ==============================================================================
+
+// 主机是否在读取: 已连接 且 TX 缓冲区有足够剩余空间
+static bool cdc_output_ready(uint32_t need_bytes) {
+    return tud_cdc_connected() && tud_cdc_n_write_available(0) >= need_bytes;
+}
+
+// 受控输出一小块: 空间不足返回 false (调用者放弃剩余输出)
+static bool cdc_write_gated(const char* s, uint32_t len) {
+    if (!cdc_output_ready(len + 16)) return false;
+    printf("%.*s", (int)len, s);
+    return true;
+}
+
 // 输出监控数据（JSON格式，包含所有关键信息）
-// 注意：此函数会调用大量printf，只在monitor_mode下按间隔调用
-// 如果CDC TX缓冲区满，printf可能会短暂阻塞
+// 全部输出先构建到栈缓冲, 再分块经背压门控发送 —— CDC 拥塞时截断本轮,
+// 绝不阻塞实时主循环
 static void output_monitor_data() {
     uint32_t now = to_ms_since_boot(get_absolute_time());
 
@@ -244,44 +288,95 @@ static void output_monitor_data() {
     // 获取Slider状态
     uint32_t slider_state = slider_get_state();
 
-    // 一次性输出所有关键数据（减少通信次数）
-    printf("{\r\n");
-    printf("  \"t\": %lu,\r\n", now);
-
-    // Slider状态（32 bits）
-    printf("  \"slider\": %lu,\r\n", slider_state);
-
-    // AIR 状态 (12-bit sensor_bitmap + 6-bit hid_bitmap)
-    printf("  \"air\": {\r\n");
-    printf("    \"sensor\": %u,\r\n", air_debug.sensor_bitmap);  // 12-bit
-    printf("    \"hid\": %u\r\n", air_debug.hid_bitmap);          // 6-bit
-    printf("  },\r\n");
-
-    // Overlay 状态
-    printf("  \"overlay\": %d,\r\n", cfg->air_overlay_enabled);
-
-    // TOF 传感器数据
-    printf("  \"tof\": [\r\n");
-    for (int i = 0; i < 5; i++) {
-        printf("    {\"d\": %d, \"a\": %lu, \"v\": %d}%s\r\n",
+    // 一次性构建全部 JSON（有界缓冲, snprintf 保证不越界）
+    static char buf[1024];
+    int len = snprintf(buf, sizeof(buf),
+        "{\r\n"
+        "  \"t\": %lu,\r\n"
+        "  \"slider\": %lu,\r\n"
+        "  \"air\": {\"sensor\": %u, \"hid\": %u},\r\n"
+        "  \"overlay\": %d,\r\n"
+        "  \"tof\": [\r\n",
+        (unsigned long)now,
+        (unsigned long)slider_state,
+        air_debug.sensor_bitmap,
+        air_debug.hid_bitmap,
+        cfg->air_overlay_enabled);
+    for (int i = 0; i < 5 && len > 0 && len < (int)sizeof(buf); i++) {
+        len += snprintf(buf + len, sizeof(buf) - len,
+               "    {\"d\": %d, \"a\": %lu, \"v\": %d}%s\r\n",
                air_debug.sensor_distances[i],
-               air_debug.sensor_ages[i],
+               (unsigned long)air_debug.sensor_ages[i],
                air_debug.sensor_valid[i] ? 1 : 0,
                (i < 4) ? "," : "");
     }
-    printf("  ],\r\n");
+    len += snprintf(buf + len, sizeof(buf) - len,
+        "  ],\r\n"
+        "  \"perf\": {\r\n"
+        "    \"loop_avg\": %lu,\r\n"
+        "    \"loop_max\": %lu,\r\n"
+        "    \"tud_max_gap\": %lu,\r\n"
+        "    \"hid_sends\": %lu,\r\n"
+        "    \"hid_busy_max\": %lu,\r\n"
+        "    \"hid_gap_max\": %lu,\r\n"
+        "    \"tof_new\": %lu,\r\n"
+        "    \"tof_poll_avg\": %lu,\r\n"
+        "    \"tof_poll_max\": %lu,\r\n"
+        "    \"core1_hb\": %lu,\r\n"
+        "    \"stall_us\": %lu\r\n"
+        "  }\r\n"
+        "}\r\n---\r\n",
+        (unsigned long)main_loop_avg_us,
+        (unsigned long)main_loop_max_us,
+        (unsigned long)max_tud_task_interval_us,
+        (unsigned long)hid_send_count,
+        (unsigned long)max_hid_not_ready_us,
+        (unsigned long)max_hid_send_gap_us,
+        (unsigned long)tof_reader_get_new_data_count(),
+        (unsigned long)tof_reader_get_avg_poll_interval_us(),
+        (unsigned long)tof_reader_get_max_poll_interval_us(),
+        (unsigned long)tof_reader_get_heartbeat(),
+        (unsigned long)tof_reader_get_last_stall_us());
+    if (len < 0 || len >= (int)sizeof(buf)) len = sizeof(buf) - 1;
 
-    // 性能数据
-    printf("  \"perf\": {\r\n");
-    printf("    \"loop_avg\": %lu,\r\n", main_loop_avg_us);
-    printf("    \"loop_max\": %lu,\r\n", main_loop_max_us);
-    printf("    \"hid_sends\": %lu,\r\n", hid_send_count);
-    printf("    \"tof_new\": %lu,\r\n", tof_reader_get_new_data_count());
-    printf("    \"tof_poll_avg\": %lu,\r\n", tof_reader_get_avg_poll_interval_us());
-    printf("    \"tof_poll_max\": %lu\r\n", tof_reader_get_max_poll_interval_us());
-    printf("  }\r\n");
-    printf("}\r\n");
-    printf("---\r\n");  // 分隔符，方便解析
+    // 分块发送（64B 小块: 每次 flush 恰好填满一个 EP 包, TX FIFO 不积压）
+    uint32_t pos = 0;
+    while (pos < (uint32_t)len) {
+        uint32_t chunk = len - pos;
+        if (chunk > 64) chunk = 64;
+        if (!cdc_write_gated(buf + pos, chunk)) {
+            monitor_truncated_count++;   // 背压: 放弃本轮剩余输出
+            break;
+        }
+        pos += chunk;
+    }
+}
+
+// Core1 ToF 事件输出: 每轮最多弹 4 条, 逐条经背压门控打印
+static void tof_event_task() {
+    static const char* const evt_names[] = {
+        "NONE", "CORE1_STARTED", "INIT_FAIL", "READY",
+        "BUDGET_VERIFY_FAIL", "OFFLINE", "RECOVERY_ATTEMPT",
+        "RECOVERY_OK", "RECOVERY_FAIL", "BUS_RECOVERY_START",
+        "BUS_RECOVERY_OK", "BUS_RECOVERY_FAIL", "FULL_REINIT_DONE",
+        "STALL_NOTED",
+    };
+
+    tof_event_t ev;
+    for (int i = 0; i < 4 && tof_event_pop(&ev); i++) {
+        if (!cdc_output_ready(96)) break;   // CDC 拥塞: 事件留在队列, 下轮再取
+        const char* name = (ev.type < sizeof(evt_names) / sizeof(evt_names[0]))
+                               ? evt_names[ev.type] : "?";
+        if (ev.sensor <= 4) {
+            printf("[TOF %lu ms] TOF%u %s (arg=0x%08lX)\r\n",
+                   (unsigned long)ev.timestamp_ms, ev.sensor + 1, name,
+                   (unsigned long)ev.arg32);
+        } else {
+            printf("[TOF %lu ms] %s (lo=%u hi=%u arg=0x%08lX)\r\n",
+                   (unsigned long)ev.timestamp_ms, name,
+                   ev.arg16_lo, ev.arg16_hi, (unsigned long)ev.arg32);
+        }
+    }
 }
 
 // CDC command handler
@@ -397,10 +492,15 @@ static void cdc_process_command(const char* cmd) {
         printf("  \"perf\": {\r\n");
         printf("    \"loop_avg_us\": %lu,\r\n", main_loop_avg_us);
         printf("    \"loop_max_us\": %lu,\r\n", main_loop_max_us);
+        printf("    \"tud_max_gap_us\": %lu,\r\n", max_tud_task_interval_us);
         printf("    \"hid_sends\": %lu,\r\n", hid_send_count);
+        printf("    \"hid_busy_max_us\": %lu,\r\n", max_hid_not_ready_us);
+        printf("    \"hid_gap_max_us\": %lu,\r\n", max_hid_send_gap_us);
         printf("    \"tof_new_data\": %lu,\r\n", tof_reader_get_new_data_count());
         printf("    \"tof_poll_avg_us\": %lu,\r\n", tof_reader_get_avg_poll_interval_us());
-        printf("    \"tof_poll_max_us\": %lu\r\n", tof_reader_get_max_poll_interval_us());
+        printf("    \"tof_poll_max_us\": %lu,\r\n", tof_reader_get_max_poll_interval_us());
+        printf("    \"core1_hb\": %lu,\r\n", tof_reader_get_heartbeat());
+        printf("    \"stall_us\": %lu\r\n", tof_reader_get_last_stall_us());
         printf("  },\r\n");
         printf("  \"i2c_err\": {\r\n");
         printf("    \"mpr\": [%lu, %lu, %lu],\r\n",
@@ -447,12 +547,24 @@ static void cdc_process_command(const char* cmd) {
         printf("    avg: %lu us\r\n", main_loop_avg_us);
         printf("    max: %lu us\r\n", main_loop_max_us);
         printf("    count: %lu\r\n", main_loop_count);
+        printf("  USB servicing:\r\n");
+        printf("    tud_task calls: %lu\r\n", tud_task_count);
+        printf("    max tud_task gap: %lu us\r\n", max_tud_task_interval_us);
         printf("  HID:\r\n");
         printf("    sends: %lu\r\n", hid_send_count);
+        printf("    ready-false count: %lu\r\n", hid_ready_false_count);
+        printf("    max not-ready streak: %lu us\r\n", max_hid_not_ready_us);
+        printf("    max send gap: %lu us\r\n", max_hid_send_gap_us);
+        printf("  CDC backpressure:\r\n");
+        printf("    monitor truncated: %lu\r\n", monitor_truncated_count);
+        printf("    commands dropped: %lu\r\n", cdc_cmd_dropped_count);
+        printf("    tof events dropped: %lu\r\n", tof_event_dropped_count());
         printf("  Core1 TOF:\r\n");
         printf("    new_data: %lu\r\n", tof_reader_get_new_data_count());
         printf("    poll_avg: %lu us\r\n", tof_reader_get_avg_poll_interval_us());
         printf("    poll_max: %lu us\r\n", tof_reader_get_max_poll_interval_us());
+        printf("    core1_heartbeat: %lu\r\n", tof_reader_get_heartbeat());
+        printf("    last_stall: %lu us\r\n", tof_reader_get_last_stall_us());
     }
     else if (strcmp(cmd, "SLIDER") == 0) {
         printf("Raw slider state: 0x%08lX\r\n", slider_get_state());
@@ -519,11 +631,11 @@ static void cdc_process_command(const char* cmd) {
         printf("    touch/release: 1-255 (no limit for debugging)\r\n");
         printf("    note: touch must be > release (auto-corrected if not)\r\n");
         printf("  CONFIG?\r\n");
-        printf("  SAVE\r\n");
+        printf("  SAVE (deferred, executes on next loop)\r\n");
         printf("  DEFAULT\r\n");
         printf("  STATUS\r\n");
         printf("  AIRDEBUG\r\n");
-        printf("  PERF\r\n");
+        printf("  PERF (incl. USB/HID/CDC/Core1 stats)\r\n");
         printf("  START_MONITOR <interval_ms>\r\n");
         printf("  STOP_MONITOR\r\n");
         printf("  SLIDER, MPR, DEBUG, RESET\r\n");
@@ -560,7 +672,10 @@ static void cdc_task() {
     // Limit the number of bytes processed per call to avoid blocking
     // 如果CDC有大量数据，每轮最多处理64字节
     const int MAX_CDC_READ_PER_LOOP = 64;
+    // 单次 cdc_task 执行时间上限 (us): 即使主机突发大量数据也不挤压实时任务
+    const uint64_t MAX_CDC_TASK_US = 1000;
     int bytes_read = 0;
+    uint64_t deadline = time_us_64() + MAX_CDC_TASK_US;
 
     while (tud_cdc_available() && bytes_read < MAX_CDC_READ_PER_LOOP) {
         char c = tud_cdc_read_char();
@@ -569,12 +684,21 @@ static void cdc_task() {
         if (c == '\r' || c == '\n') {
             if (cdc_rx_pos > 0) {
                 cdc_rx_buf[cdc_rx_pos] = '\0';
-                cdc_process_command(cdc_rx_buf);
+                // 命令回复可能产生数百字节输出: 主机已连接但停止读取
+                // (TX 缓冲接近满) 时丢弃本条命令, 防止 printf 进入
+                // stdio CDC 后端的 500ms 阻塞重试路径
+                if (cdc_output_ready(192)) {
+                    cdc_process_command(cdc_rx_buf);
+                } else {
+                    cdc_cmd_dropped_count++;
+                }
                 cdc_rx_pos = 0;
             }
         } else if (cdc_rx_pos < sizeof(cdc_rx_buf) - 1) {
             cdc_rx_buf[cdc_rx_pos++] = c;
         }
+
+        if (time_us_64() > deadline) break;   // 执行时间上限, 保证循环节拍
     }
 }
 
@@ -695,8 +819,18 @@ int main(void) {
         // 性能统计：记录循环开始时间
         uint64_t loop_start = time_us_64();
 
+        // ===== USB 服务间隔统计 =====
+        // 真正决定 USB 稳定性的是两次 tud_task() 之间的最大空洞:
+        // 主循环任何阻塞路径都会直接体现在该统计上
+        uint32_t tud_interval_us = (uint32_t)(loop_start - last_tud_task_us);
+        if (last_tud_task_us && tud_interval_us > max_tud_task_interval_us) {
+            max_tud_task_interval_us = tud_interval_us;
+        }
+        last_tud_task_us = loop_start;
+
         // ===== TinyUSB Task（最高优先级，必须持续运行）=====
         tud_task();
+        tud_task_count++;
 
         // ===== CDC任务（低优先级，限制每次处理量）=====
         cdc_task();
@@ -722,7 +856,10 @@ int main(void) {
         report_usb_hid();
 
         // ===== 低优先级后台任务 =====
-        save_loop();  // 当前为空，Flash操作只在SAVE命令时执行
+        save_loop();   // 执行延迟的 Flash 保存（无请求时零开销）
+
+        // ===== Core1 ToF 事件输出（非阻塞事件队列 → CDC）=====
+        tof_event_task();
 
         // 性能统计：计算循环耗时
         uint64_t loop_end = time_us_64();

@@ -26,12 +26,15 @@
 
 #include "tof_reader.h"
 #include "vl53l0x.h"
+#include "tof_events.h"
 
 #include "pico/time.h"
 #include "pico/multicore.h"
 
 #include <string.h>
-#include <stdio.h>
+
+// 本文件运行在 Core1, 禁止 printf / 任何 TinyUSB API:
+// 日志一律通过 tof_event_post() 进入非阻塞事件队列, 由 Core0 的 CDC 输出。
 
 namespace Chuni245Tof {
 
@@ -93,6 +96,12 @@ constexpr uint32_t RECOVERY_BACKOFF_MAX_MS = 10000u;
 // 恢复成功后若在短时间内再次故障, 视为反复故障, 退避时间随之增长
 constexpr uint32_t RECOVERY_REPEAT_WINDOW_MS = 5000u;
 
+// 全局停顿判定阈值 (us): 单轮轮询间隔超过该值说明双核被外部冻结
+// (Core0 Flash 擦写时 multicore lockout + XIP 停摆, 典型 50-400ms),
+// 而非正常的恢复让出 (正常最大 ~15ms)。此时刷新时间基准, 防止把停顿
+// 误判成全员测距卡死而引发恢复风暴。
+constexpr uint32_t SYSTEM_STALL_THRESHOLD_US = 150000u;
+
 //==============================================================================
 // 类型
 //==============================================================================
@@ -127,6 +136,8 @@ static volatile uint32_t total_poll_rounds = 0;
 static volatile uint32_t max_poll_interval_us = 0;
 static volatile uint32_t avg_poll_interval_us = 0;
 static volatile uint32_t bus_recovery_count = 0;
+static volatile uint32_t core1_heartbeat = 0;   // Core1 活跃性心跳 (每轮 +1)
+static volatile uint32_t last_stall_us = 0;     // 最近一次全局停顿的时长
 
 // 恢复状态机
 static sensor_mgmt_t mgmt[5];
@@ -256,18 +267,18 @@ static void take_sensor_offline(int i, uint32_t now_ms)
 // 尝试恢复单个传感器
 static void attempt_recovery(int i, uint32_t now_ms)
 {
-    printf("[TOF_READER] TOF%d recovery attempt (fail=%u)\n", i + 1, mgmt[i].fail_count);
+    tof_event_post(TOF_EVT_RECOVERY_ATTEMPT, i, mgmt[i].fail_count);
     mgmt[i].last_attempt_ms = now_ms;
 
     if (vl53l0x_recover_sensor(i)) {
-        printf("[TOF_READER] TOF%d recovered\n", i + 1);
+        tof_event_post(TOF_EVT_RECOVERY_OK, i, 0);
         mgmt[i].down = false;
         mgmt[i].fail_count = 0;
         mgmt[i].last_success_ms = now_ms;
         // 快照保持无效, 等待真实新数据后才置 valid
         snapshot_invalidate(i);
     } else {
-        printf("[TOF_READER] TOF%d recovery FAILED\n", i + 1);
+        tof_event_post(TOF_EVT_RECOVERY_FAIL, i, mgmt[i].fail_count);
         mgmt[i].fail_count++;
         mgmt[i].backoff_ms = next_backoff(mgmt[i].fail_count);
     }
@@ -321,7 +332,7 @@ static bool recovery_escalation_due(uint32_t now_ms)
 // 甄别通过的传感器原样保留（快照/序列号/状态全部不动）, 继续测距
 static void run_bus_recovery(uint32_t now_ms)
 {
-    printf("[TOF_READER] BUS RECOVERY start (bus-level fault confirmed)\n");
+    tof_event_post(TOF_EVT_BUS_RECOVERY_START, 0xFF, 0);
     bus_recovery_in_progress = true;
     bus_recovery_count++;
 
@@ -335,7 +346,7 @@ static void run_bus_recovery(uint32_t now_ms)
 
     if (!bus_ok) {
         // Level 4 (最后手段): 9-clock 仍无法释放总线 → 全传感器 XSHUT 重初始化
-        printf("[TOF_READER] bus recovery FAILED -> full reinit (last resort)\n");
+        tof_event_post(TOF_EVT_BUS_RECOVERY_FAIL, 0xFF, 0);
         vl53l0x_reinit_all();
 
         // 全量重初始化已复位全部传感器: 所有快照失效, 恢复状态重新播种
@@ -370,8 +381,15 @@ static void run_bus_recovery(uint32_t now_ms)
                 casualties++;
             }
         }
-        printf("[TOF_READER] bus recovery OK: %d survived, %d -> per-sensor recovery\n",
-               survivors, casualties);
+        // 幸存者统计: 借 arg16 通道随事件载荷发布
+        tof_event_t ev;
+        ev.timestamp_ms = to_ms_since_boot(get_absolute_time());
+        ev.arg32 = (uint32_t)casualties;
+        ev.sensor = 0xFF;
+        ev.type = TOF_EVT_BUS_RECOVERY_OK;
+        ev.arg16_lo = (uint8_t)survivors;
+        ev.arg16_hi = (uint8_t)casualties;
+        tof_event_push(&ev);
     }
 
     // "无效果" 总线恢复 (总线恢复成功但没有任何就绪传感器可甄别 ——
@@ -409,6 +427,12 @@ static void core1_main(void)
 {
     core1_running = true;
 
+    // 注册为 flash 操作 lockout victim: Core0 执行 Flash 擦写 (SAVE 命令) 前
+    // 会通过 multicore_lockout 把本核停到 RAM 中的安全点, 避免双核 XIP 取指
+    // 撞上 Flash 编程窗口 (不注册的话 Core1 会在 Flash 忙碌期间从 XIP 取指,
+    // 行为未定义)。lockout 期间本核冻结, 恢复后的停顿检测会善后时间基准。
+    multicore_lockout_victim_init();
+
     // 注册让出回调: 之后所有初始化/恢复的长等待期间都会继续轮询健康传感器
     vl53l0x_set_yield_callback(yield_poll_healthy);
 
@@ -426,13 +450,14 @@ static void core1_main(void)
         }
     }
 
-    printf("[TOF_READER] Core1 polling started\n");
+    tof_event_post(TOF_EVT_CORE1_STARTED, 0xFF, 0);
 
     uint64_t last_round_us = time_us_64();
     uint32_t poll_interval_sum_us = 0;
     uint32_t poll_interval_count = 0;
 
     while (core1_running) {
+        core1_heartbeat++;
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
 
         // ---- 1. 轮询所有就绪传感器 ----
@@ -486,8 +511,10 @@ static void core1_main(void)
                     bool range_stuck = (since_data >= NO_DATA_RECOVERY_MS);
 
                     if ((comm_dead && !bus_suspected) || range_stuck) {
-                        printf("[TOF_READER] TOF%d offline: consec_err=%u comm_silent=%ums no_data=%ums\n",
-                               i + 1, consec, since_comm, since_data);
+                        // 掉线事件 (含原因) 进队列; arg32 打包:
+                        // bit31 = 测距卡死 (0=通信失联), bit0-23 = 静默/无数据 ms (取 no_data)
+                        uint32_t reason = range_stuck ? 0x80000000u : 0u;
+                        tof_event_post(TOF_EVT_OFFLINE, i, reason | (since_data & 0xFFFFFFu));
                         take_sensor_offline(i, now_ms);
                     }
                 }
@@ -499,12 +526,32 @@ static void core1_main(void)
             }
         }
 
-        // ---- 4. 轮询间隔统计 + 保持 ~100us 轮询节拍 ----
+        // ---- 4. 轮询间隔统计 + 全局停顿检测 + 保持 ~100us 轮询节拍 ----
         uint64_t now_us = time_us_64();
         uint32_t interval = (uint32_t)(now_us - last_round_us);
         if (interval > max_poll_interval_us) {
             max_poll_interval_us = interval;
         }
+
+        // 全局停顿检测: 双核同时被冻结 (Core0 Flash 擦写 / multicore lockout /
+        // 调试器停止) 后, 本轮间隔会一次性跳变到几十至几百 ms。此时 "无数据"
+        // 与 "通信静默" 计时被整体放大, 若不刷新时间基准, 恢复状态机会把
+        // 停顿误判成全员测距卡死而引发恢复风暴。刷新后由真实轮询结果重新判定。
+        if (interval > SYSTEM_STALL_THRESHOLD_US) {
+            uint32_t stall_now = to_ms_since_boot(get_absolute_time());
+            vl53l0x_note_global_stall(stall_now);
+            for (int i = 0; i < 5; i++) {
+                if (mgmt[i].down) {
+                    mgmt[i].last_attempt_ms = stall_now;   // 退避计时同样顺延
+                }
+            }
+            last_stall_us = interval;
+            tof_event_post(TOF_EVT_STALL_NOTED, 0xFF, interval);
+            // 停顿间隔不污染轮询统计: 丢弃当前累计窗口
+            poll_interval_sum_us = 0;
+            poll_interval_count = 0;
+        }
+
         poll_interval_sum_us += interval;
         poll_interval_count++;
         if (poll_interval_count >= 1000) {
@@ -612,6 +659,18 @@ uint32_t tof_reader_get_max_poll_interval_us(void)
 uint32_t tof_reader_get_new_data_count(void)
 {
     return new_data_count;
+}
+
+// Core1 活跃性心跳: Core0 两次读取之间计数值增长 = Core1 存活
+uint32_t tof_reader_get_heartbeat(void)
+{
+    return core1_heartbeat;
+}
+
+// 最近一次全局停顿的时长 (us), 0 = 自启动以来未检测到
+uint32_t tof_reader_get_last_stall_us(void)
+{
+    return last_stall_us;
 }
 
 } // namespace Chuni245Tof

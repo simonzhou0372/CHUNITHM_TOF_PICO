@@ -13,6 +13,7 @@
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "pico/mutex.h"
+#include "pico/multicore.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -119,6 +120,11 @@ static uint32_t calculate_crc32(const uint8_t* data, uint32_t len) {
 static mutex_t* save_mutex = nullptr;
 static uint32_t save_magic = 0;
 static bool save_initialized = false;
+
+// 延迟保存请求（仅 Core0 访问）
+static uint8_t pending_data[FLASH_PAGE_SIZE];
+static uint32_t pending_len = 0;
+static volatile bool pending_flag = false;
 
 //==============================================================================
 // API 实现
@@ -251,16 +257,23 @@ bool save_write(const void* data, uint32_t len) {
     memcpy(buffer, &cfg_to_save, sizeof(cfg_to_save));
 
     // 4. 擦除和写入 Flash
+    // Flash 擦写期间 XIP 不可用, 双核都会停摆 (典型 ~50ms, 最坏 ~400ms):
+    //   - Core0: 中断关闭 + 从 RAM 执行 flash 驱动
+    //   - Core1: 通过 multicore lockout 停到 RAM 安全点 —— 否则 Core1 会在
+    //     Flash 忙碌期间继续从 XIP 取指, 行为未定义
     uint32_t ints = save_and_disable_interrupts();
 
-    // 擦除 sector
-    printf("CONFIG SAVE: Erasing sector at offset 0x%X...\r\n", CONFIG_FLASH_OFFSET);
-    flash_range_erase(CONFIG_FLASH_OFFSET, FLASH_SECTOR_SIZE);
-
-    // 写入数据
-    printf("CONFIG SAVE: Programming %d bytes at offset 0x%X...\r\n",
-           FLASH_PAGE_SIZE, CONFIG_FLASH_OFFSET);
-    flash_range_program(CONFIG_FLASH_OFFSET, buffer, FLASH_PAGE_SIZE);
+    // lockout_ready = "Core1 未启动" 或 "victim 已初始化" 两种安全情形
+    if (multicore_lockout_ready()) {
+        multicore_lockout_start_blocking();
+        flash_range_erase(CONFIG_FLASH_OFFSET, FLASH_SECTOR_SIZE);
+        flash_range_program(CONFIG_FLASH_OFFSET, buffer, FLASH_PAGE_SIZE);
+        multicore_lockout_end_blocking();
+    } else {
+        // victim 未注册 (仅可能发生在 Core1 尚未启动的极早期)
+        flash_range_erase(CONFIG_FLASH_OFFSET, FLASH_SECTOR_SIZE);
+        flash_range_program(CONFIG_FLASH_OFFSET, buffer, FLASH_PAGE_SIZE);
+    }
 
     restore_interrupts(ints);
 
@@ -309,9 +322,46 @@ bool save_write(const void* data, uint32_t len) {
     return true;
 }
 
+// 请求保存（延迟执行）: 立即快照配置, 实际 Flash 擦写交给 save_loop()
+bool save_request_write(const void* data, uint32_t len) {
+    if (!save_initialized || !data) {
+        printf("CONFIG SAVE: ERROR - not initialized or null data\r\n");
+        return false;
+    }
+    if (len > sizeof(PersistentConfig)) {
+        printf("CONFIG SAVE: ERROR - len %u too large\r\n", (unsigned)len);
+        return false;
+    }
+    if (pending_flag) {
+        printf("CONFIG SAVE: ERROR - another save already pending\r\n");
+        return false;
+    }
+
+    // 立即快照: Flash 写入使用请求时刻的一致性数据
+    memcpy(pending_data, data, len);
+    pending_len = len;
+    pending_flag = true;
+    return true;
+}
+
+bool save_pending() {
+    return pending_flag;
+}
+
+// Core0 主循环低优先级调用: 执行待保存的 Flash 擦写。
+// 注意: 擦写期间 USB 约 50-400ms 无输出 (双核 XIP 停摆, 硬件层面不可避免),
+// 因此绝不从 CDC 命令解析路径同步调用, 而是延迟到主循环的独立节拍执行。
 void save_loop() {
-    // Handle deferred save operations if needed
-    // For now, saves happen synchronously
+    if (!pending_flag) return;
+
+    // 先清标志: 失败不重试 (Flash 操作失败属于硬件级异常, 自动重试风险更大)
+    pending_flag = false;
+
+    printf("CONFIG SAVE: deferred flash write starting (USB pauses briefly)...\r\n");
+
+    bool ok = save_write(pending_data, pending_len);
+
+    printf(ok ? "SAVE OK\r\n" : "SAVE ERROR\r\n");
 }
 
 } // namespace Chuni245Tof

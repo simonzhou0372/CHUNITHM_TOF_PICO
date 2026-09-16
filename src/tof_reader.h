@@ -45,6 +45,12 @@ uint32_t tof_reader_get_avg_poll_interval_us();
 uint32_t tof_reader_get_max_poll_interval_us();
 uint32_t tof_reader_get_new_data_count();
 
+// Core1 活跃性心跳 (每轮轮询 +1): 与上次读取比较, 增长 = Core1 存活
+uint32_t tof_reader_get_heartbeat();
+
+// 最近一次全局停顿时长 (us) —— 双核被冻结 (如 Flash 擦写) 的直接证据
+uint32_t tof_reader_get_last_stall_us();
+
 } // namespace Chuni245Tof
 
 using namespace Chuni245Tof;

@@ -232,12 +232,14 @@ bool config_save() {
            cfg->tof_offset, cfg->tof_pitch,
            cfg->air12_range, cfg->air_min_hold_ms, cfg->air_overlay_enabled);
 
-    bool success = save_write(cfg, sizeof(config_t));
+    // 延迟保存: 快照后由 save_loop() 在主循环独立节拍执行 Flash 擦写,
+    // 避免 CDC 命令路径直接擦写 Flash 造成实时 HID 长时间停顿
+    bool success = save_request_write(cfg, sizeof(config_t));
 
     if (success) {
-        printf("CONFIG SAVE: SUCCESS\r\n");
+        printf("CONFIG SAVE: QUEUED (executes on next main loop)\r\n");
     } else {
-        printf("CONFIG SAVE: FAILED\r\n");
+        printf("CONFIG SAVE: FAILED to queue\r\n");
     }
 
     return success;

@@ -10,6 +10,15 @@
  *   (全量重初始化仅在总线恢复失败时作为最后手段)
  * - Sensor Health 状态机
  * - 所有总线操作只能在 Core1 执行（I2C1 由 Core1 独占）
+ *
+ * Recovery Access Boundary (恢复访问边界):
+ * - 本文件 + tof_reader.cpp 是全工程唯一允许接触 I2C1 外设、
+ *   I2C1 GPIO (GP6/GP7)、ToF XSHUT (GP1~GP5) 的翻译单元
+ * - 恢复路径 (vl53l0x_recover_sensor / vl53l0x_bus_recover / vl53l0x_reinit_all)
+ *   绝不触碰: I2C0 外设、GPIO16/17、MPR121、Slider、USB、任何板级/系统级初始化
+ * - I2C0 (MPR121) 由 mpr121.cpp 独占且仅 Core0 访问, 与本文件无任何共享状态;
+ *   Pico SDK 的 i2c_init/i2c_deinit 内部复位掩码按实例精确 (reset_block_num),
+ *   对 I2C1 的 deinit/init 在硬件层面不可能波及 I2C0
  */
 
 #ifndef VL53L0X_H
@@ -121,6 +130,10 @@ uint32_t vl53l0x_get_recovery_count(uint8_t index);
 
 // 配置的 TimingBudget (us) —— 统一配置源
 uint32_t vl53l0x_get_timing_budget_us(void);
+
+// 全局停顿善后（Core1 调用）: 双核同时被冻结 (Core0 Flash 擦写 / multicore lockout)
+// 后刷新所有传感器的时间基准并清零连续错误, 防止恢复状态机把停顿误判为掉线。
+void vl53l0x_note_global_stall(uint32_t now_ms);
 
 } // namespace Chuni245Tof
 

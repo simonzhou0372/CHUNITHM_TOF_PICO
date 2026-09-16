@@ -14,13 +14,13 @@
 
 #include "vl53l0x.h"
 #include "board_defs.h"
+#include "tof_events.h"
 
 #include "pico/time.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
 
 #include <string.h>
-#include <stdio.h>
 
 namespace Chuni245Tof {
 
@@ -682,8 +682,8 @@ static bool init_sensor(uint8_t index)
     if (!get_measurement_timing_budget(new_addr, &actual_budget)) return false;
     int32_t diff = (int32_t)actual_budget - (int32_t)VL53L0X_TIMING_BUDGET_US;
     if (diff < -TIMING_BUDGET_VERIFY_TOLERANCE_US || diff > TIMING_BUDGET_VERIFY_TOLERANCE_US) {
-        printf("[VL53L0X] TOF%d budget verify FAILED: %luus (target %luus)\n",
-               index + 1, (unsigned long)actual_budget, (unsigned long)VL53L0X_TIMING_BUDGET_US);
+        // 事件进队列（Core0 负责 CDC 输出）—— Core1 禁止 printf
+        tof_event_post(TOF_EVT_BUDGET_VERIFY_FAIL, index, actual_budget);
         return false;
     }
 
@@ -708,10 +708,8 @@ static bool init_sensor(uint8_t index)
     uint16_t range_status = 0;
     if (!read_reg16(new_addr, REG_RESULT_RANGE_STATUS, &range_status)) return false;
 
-    printf("[VL53L0X] TOF%d ready: addr=0x%02X TB=%luus spad=%u%s pre_reg=0x%04X fin_reg=0x%04X status=0x%04X\n",
-           index + 1, new_addr, (unsigned long)actual_budget,
-           spad_count, spad_type_is_aperture ? "(a)" : "",
-           pre_timeout_reg, final_timeout_reg, range_status);
+    // 就绪事件进队列（Core0 负责 CDC 输出）—— Core1 禁止 printf
+    tof_event_post(TOF_EVT_READY, index, actual_budget);
 
     return true;
 }
@@ -758,7 +756,7 @@ void vl53l0x_init(void)
             health_override[i] = HO_OFFLINE;
             // 传感器初始化失败: 拉低 XSHUT 保持复位, 后续由恢复状态机重试
             gpio_put(xshut_pins[i], 0);
-            printf("[VL53L0X] TOF%d init FAILED\n", i + 1);
+            tof_event_post(TOF_EVT_INIT_FAIL, i, 0);
         }
     }
 }
@@ -798,7 +796,8 @@ bool vl53l0x_recover_sensor(uint8_t index)
 // I2C1 总线恢复: 停止外设 → SDA/SCL 转 GPIO → 检测 SDA 卡低 → 9 时钟 + STOP → 恢复外设
 bool vl53l0x_bus_recover(void)
 {
-    printf("[VL53L0X] I2C1 bus recovery start\n");
+    // 严格有界: 最多 9 个时钟脉冲 (每个 ~10us) + STOP (~15us) + 两次外设重初始化,
+    // 无任何无限等待路径。START 事件由调用者 (tof_reader 状态机) 发布。
 
     // ---- 1. 停止 I2C 外设, 释放引脚 ----
     i2c_deinit(I2C1_PORT);
@@ -853,21 +852,14 @@ bool vl53l0x_bus_recover(void)
     gpio_pull_up(I2C1_SDA);
     gpio_pull_up(I2C1_SCL);
 
-    if (!bus_ok) {
-        printf("[VL53L0X] I2C1 bus recovery FAILED: SDA=%d SCL=%d\n",
-               gpio_get(I2C1_SDA), gpio_get(I2C1_SCL));
-        return false;
-    }
+    // 结果事件由调用者 (tof_reader 状态机) 统一发布
 
-    printf("[VL53L0X] I2C1 bus recovery OK\n");
-    return true;
+    return bus_ok;
 }
 
 // 全传感器恢复: 所有 XSHUT 拉低 → 逐颗释放并完整初始化
 bool vl53l0x_reinit_all(void)
 {
-    printf("[VL53L0X] full reinit of all sensors\n");
-
     // 全部下线 + 快照语义由调用者负责
     for (int i = 0; i < 5; i++) {
         sensor_ready[i] = false;
@@ -878,6 +870,7 @@ bool vl53l0x_reinit_all(void)
 
     sleep_ms(XSHUT_RESET_DELAY_MS);   // 全部复位期间无传感器可轮询, 直接延时即可
 
+    uint8_t ok_bitmap = 0;
     bool all_ok = true;
     for (int i = 0; i < 5; i++) {
         recovery_count[i]++;
@@ -888,14 +881,18 @@ bool vl53l0x_reinit_all(void)
             uint32_t now = to_ms_since_boot(get_absolute_time());
             last_new_data_ms[i] = now;
             last_comm_ok_ms[i] = now;
+            ok_bitmap |= (1u << i);
         } else {
             sensor_ready[i] = false;
             health_override[i] = HO_OFFLINE;
             gpio_put(xshut_pins[i], 0);
             all_ok = false;
-            printf("[VL53L0X] TOF%d reinit FAILED\n", i + 1);
+            tof_event_post(TOF_EVT_INIT_FAIL, i, 0);
         }
     }
+
+    // 汇总事件进队列（Core0 负责 CDC 输出）—— Core1 禁止 printf
+    tof_event_post(TOF_EVT_FULL_REINIT_DONE, 0xFF, ok_bitmap);
 
     return all_ok;
 }
@@ -1066,6 +1063,22 @@ uint32_t vl53l0x_get_recovery_count(uint8_t index)
 uint32_t vl53l0x_get_timing_budget_us(void)
 {
     return VL53L0X_TIMING_BUDGET_US;
+}
+
+// 全局停顿善后: Core0 侧 Flash 擦写 (multicore lockout + XIP 停摆) 等操作会把
+// 双核同时冻结数十至数百毫秒。停顿期间 Core1 无法轮询, 恢复后的第一轮循环里
+// "无数据时长" 会被一次性放大, 超过 NO_DATA_RECOVERY_MS 即误触发恢复风暴。
+// 由 Core1 在检测到停顿后调用: 刷新全部时间基准并清零连续错误计数,
+// 传感器真实状态由停顿后的实际轮询结果重新给出。
+void vl53l0x_note_global_stall(uint32_t now_ms)
+{
+    for (int i = 0; i < 5; i++) {
+        consecutive_errors[i] = 0;
+        if (sensor_ready[i]) {
+            last_comm_ok_ms[i] = now_ms;
+            last_new_data_ms[i] = now_ms;
+        }
+    }
 }
 
 } // namespace Chuni245Tof

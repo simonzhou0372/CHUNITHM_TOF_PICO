@@ -2,6 +2,18 @@
  * MPR121 Touch Controller Implementation
  * Uses I2C0 (SDA=16, SCL=17)
  *
+ * I2C0 总线域独占声明:
+ *   本文件是全工程唯一接触 I2C0 外设与 GPIO16/17 的翻译单元。
+ *   I2C0 初始化 (mpr121_init) 仅发生在 Core0 冷启动 (slider_init 调用),
+ *   Core1 的 VL53L0X 恢复路径 (recover_sensor / bus_recover / reinit_all)
+ *   不经过本文件, 也不会触碰 I2C0 —— MPR121 在任何 ToF 恢复期间连续运行。
+ *
+ * 零运行时恢复原则:
+ *   MPR121 几乎不会掉线, 固件不存在任何运行时 MPR121 恢复/下线/重试逻辑:
+ *   mpr_ready 仅在冷启动赋值, 运行期永不撤销; mpr121_update 遇 I2C 错误
+ *   仅计数并保留旧触摸状态, 下一次成功轮询自动续读。
+ *   唯一的手动重初始化入口是串口 RESET 命令 (mpr121_reset_baseline)。
+ *
  * ==============================================================================
  * MPR121 Touch Detection Architecture
  * ==============================================================================
@@ -242,10 +254,27 @@ void mpr121_init() {
 
     sleep_ms(10);
 
-    // Initialize all MPR121 chips
+    // Initialize all MPR121 chips.
+    //
+    // 【零运行时恢复原则】本固件没有运行时 MPR121 恢复/下线机制:
+    //   - mpr_ready 一旦置位, 运行期永不撤销; I2C 瞬时失败仅计数并保留
+    //     旧状态, 总线恢复后下一次轮询自动续读, 不存在 "误判掉线" 的
+    //     运行时路径。
+    //   - 下面的重试仅发生在上电初始化阶段: 防止上电瞬间芯片尚未就绪
+    //     或响应寄存器读到瞬时 0x00/0xFF 时被误判失效 (mpr_ready=false
+    //     会永久跳过该设备 —— 这是唯一会造成 "误判掉线且无法重启" 的
+    //     冷启动路径)。重试 3 次后仍失败才接受, 等待用户手动 RESET。
     printf("[MPR121] Initializing sensors:\n");
     for (int i = 0; i < 3; i++) {
-        mpr_ready[i] = mpr_init_single(mpr_addr[i], i);
+        bool ok = false;
+        for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+            if (attempt > 0) {
+                printf("  MPR%d [0x%02X]: retry %d/2\n", i + 1, mpr_addr[i], attempt);
+                sleep_ms(20);
+            }
+            ok = mpr_init_single(mpr_addr[i], i);
+        }
+        mpr_ready[i] = ok;
     }
 
     int count = 0;
