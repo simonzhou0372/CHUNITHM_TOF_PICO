@@ -42,6 +42,7 @@ set(SOURCES
     src/slider.cpp
     src/vl53l0x.cpp
     src/tof_reader.cpp
+    src/tof_events.cpp
     src/air.cpp
     src/button.cpp
     src/usb_descriptors.c
