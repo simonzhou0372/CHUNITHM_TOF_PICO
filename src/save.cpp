@@ -10,12 +10,15 @@
  */
 
 #include "save.h"
+#include "tof_reader.h"
 #include "hardware/flash.h"
-#include "hardware/sync.h"
 #include "pico/mutex.h"
-#include "pico/multicore.h"
+#include "pico/time.h"
+#include "pico/flash.h"     // flash_safe_execute: SDK 官方双核 Flash 安全机制
 #include <string.h>
 #include <stdio.h>
+// 注意: log_output.h 必须在所有 SDK/系统头之后 (见 mpr121.cpp 同名注释)
+#include "log_output.h"     // printf 总开关 (默认禁用, 只发送 HID 报文)
 
 namespace Chuni245Tof {
 
@@ -125,6 +128,41 @@ static bool save_initialized = false;
 static uint8_t pending_data[FLASH_PAGE_SIZE];
 static uint32_t pending_len = 0;
 static volatile bool pending_flag = false;
+static uint64_t first_pending_us = 0;   // 最早一次 pending 的时刻 (空闲门控超时用)
+
+// 空闲窗口门控: SAVE 只在 "无按键活动" 或 "等待超过上限" 时执行,
+// 避免游戏运行中随机出现一次 USB 短暂停
+static volatile bool idle_hint = true;
+static const uint32_t SAVE_FORCE_DELAY_MS = 10000;
+
+// 执行统计 (RAM 常驻, 可经 STATUS 读取)
+static uint32_t save_count = 0;
+static uint32_t save_fail_count = 0;
+static uint32_t max_save_duration_us = 0;
+static uint64_t last_save_start_us = 0;
+static uint64_t last_save_end_us = 0;
+
+// flash_safe_execute 参数包
+typedef struct {
+    uint32_t offset;
+    const uint8_t* data;
+    size_t size;
+    bool done;
+} flash_op_t;
+
+// flash_safe_execute 回调: 在双核安全 + 中断关闭的上下文中执行,
+// 只做纯 Flash 擦写, 不触碰任何外设/USB/I2C
+static void flash_erase_program_cb(void* p) {
+    flash_op_t* op = (flash_op_t*)p;
+    flash_range_erase(op->offset, FLASH_SECTOR_SIZE);
+    flash_range_program(op->offset, op->data, op->size);
+    op->done = true;
+}
+
+// 主循环每轮更新空闲提示: 无任何按键活动 = true
+void save_set_idle_hint(bool idle) {
+    idle_hint = idle;
+}
 
 //==============================================================================
 // API 实现
@@ -225,9 +263,11 @@ bool save_write(const void* data, uint32_t len) {
         return false;
     }
 
-    if (save_mutex) {
-        mutex_enter_blocking(save_mutex);
-    }
+    // ★ 不再加锁 (旧实现 mutex_enter_blocking 是无界阻塞等待)。
+    //   本函数只在 Core0 主循环的 save_loop() 空闲窗口被调用, Core1
+    //   从不触碰 save 模块 (I2C1/VL53L0X 与 Flash 保存无共享状态),
+    //   单写者模型下互斥锁是多余的 —— 且它是 "USB+LED 同时停摆" 的
+    //   候选阻塞源之一: 若锁被占, mutex_enter_blocking 无限期自旋。
 
     printf("CONFIG SAVE: Starting save operation...\r\n");
 
@@ -257,25 +297,33 @@ bool save_write(const void* data, uint32_t len) {
     memcpy(buffer, &cfg_to_save, sizeof(cfg_to_save));
 
     // 4. 擦除和写入 Flash
-    // Flash 擦写期间 XIP 不可用, 双核都会停摆 (典型 ~50ms, 最坏 ~400ms):
-    //   - Core0: 中断关闭 + 从 RAM 执行 flash 驱动
-    //   - Core1: 通过 multicore lockout 停到 RAM 安全点 —— 否则 Core1 会在
-    //     Flash 忙碌期间继续从 XIP 取指, 行为未定义
-    uint32_t ints = save_and_disable_interrupts();
-
-    // lockout_ready = "Core1 未启动" 或 "victim 已初始化" 两种安全情形
-    if (multicore_lockout_ready()) {
-        multicore_lockout_start_blocking();
-        flash_range_erase(CONFIG_FLASH_OFFSET, FLASH_SECTOR_SIZE);
-        flash_range_program(CONFIG_FLASH_OFFSET, buffer, FLASH_PAGE_SIZE);
-        multicore_lockout_end_blocking();
-    } else {
-        // victim 未注册 (仅可能发生在 Core1 尚未启动的极早期)
-        flash_range_erase(CONFIG_FLASH_OFFSET, FLASH_SECTOR_SIZE);
-        flash_range_program(CONFIG_FLASH_OFFSET, buffer, FLASH_PAGE_SIZE);
+    // 使用 SDK 官方 flash_safe_execute (pico_flash) —— 它内部负责
+    // multicore lockout (Core1 已在启动时调用 flash_safe_execute_core_init()
+    // 注册为 victim) + 中断关闭, 是双核 + XIP 环境下擦写 Flash 的官方安全机制。
+    // 注意: 擦写期间 USB 仍会暂停 (XIP 停摆, 典型 ~50ms, 最坏 ~400ms, 硬件
+    // 层面不可避免), 因此 SAVE 被设计为延迟 + 择机执行 (见 save_loop),
+    // 绝不在实时路径随机触发; 擦写本身只在 RAM 执行的回调中进行。
+    flash_op_t op = {
+        .offset = CONFIG_FLASH_OFFSET,
+        .data = buffer,
+        .size = FLASH_PAGE_SIZE,
+        .done = false,
+    };
+    // A stopped Core1 must not hold Core0 for 1s entry + 1s exit, which can
+    // exceed the 2s watchdog once flash erase time is included.
+    if (!tof_reader_flash_ready() || tof_reader_get_progress_age_us() > 10000) {
+        save_fail_count++;
+        return false;
     }
+    int rc = flash_safe_execute(flash_erase_program_cb, &op, 10);
 
-    restore_interrupts(ints);
+    if (rc != PICO_ERROR_NONE || !op.done) {
+        // 超时/双核协作失败: 放弃本次写入, 不重试 (Flash 异常属硬件级,
+        // 自动重试风险更大)
+        printf("CONFIG SAVE: flash_safe_execute failed rc=%d\r\n", rc);
+        save_fail_count++;
+        return false;
+    }
 
     // 5. 读回验证
     printf("CONFIG SAVE: Verifying write...\r\n");
@@ -286,7 +334,6 @@ bool save_write(const void* data, uint32_t len) {
     if (flash_cfg->magic != cfg_to_save.magic) {
         printf("CONFIG SAVE: VERIFY FAILED - Magic mismatch (wrote 0x%08X, read 0x%08X)\r\n",
                cfg_to_save.magic, flash_cfg->magic);
-        if (save_mutex) mutex_exit(save_mutex);
         return false;
     }
 
@@ -294,7 +341,6 @@ bool save_write(const void* data, uint32_t len) {
     if (flash_cfg->version != cfg_to_save.version) {
         printf("CONFIG SAVE: VERIFY FAILED - Version mismatch (wrote %d, read %d)\r\n",
                cfg_to_save.version, flash_cfg->version);
-        if (save_mutex) mutex_exit(save_mutex);
         return false;
     }
 
@@ -302,22 +348,16 @@ bool save_write(const void* data, uint32_t len) {
     if (flash_cfg->crc32 != cfg_to_save.crc32) {
         printf("CONFIG SAVE: VERIFY FAILED - CRC mismatch (wrote 0x%08X, read 0x%08X)\r\n",
                cfg_to_save.crc32, flash_cfg->crc32);
-        if (save_mutex) mutex_exit(save_mutex);
         return false;
     }
 
     // 验证数据内容
     if (memcmp(&flash_cfg->hid_mode, &cfg_to_save.hid_mode, len) != 0) {
         printf("CONFIG SAVE: VERIFY FAILED - Data mismatch\r\n");
-        if (save_mutex) mutex_exit(save_mutex);
         return false;
     }
 
     printf("CONFIG SAVE: SUCCESS - Verified magic, version, CRC, and data\r\n");
-
-    if (save_mutex) {
-        mutex_exit(save_mutex);
-    }
 
     return true;
 }
@@ -341,6 +381,7 @@ bool save_request_write(const void* data, uint32_t len) {
     memcpy(pending_data, data, len);
     pending_len = len;
     pending_flag = true;
+    first_pending_us = 0;   // 空闲门控计时从下一次 save_loop 开始
     return true;
 }
 
@@ -350,18 +391,45 @@ bool save_pending() {
 
 // Core0 主循环低优先级调用: 执行待保存的 Flash 擦写。
 // 注意: 擦写期间 USB 约 50-400ms 无输出 (双核 XIP 停摆, 硬件层面不可避免),
-// 因此绝不从 CDC 命令解析路径同步调用, 而是延迟到主循环的独立节拍执行。
+// 因此绝不从 CDC 命令解析路径同步调用, 而是延迟到主循环的独立节拍执行;
+// 且只在 "无按键活动" (空闲窗口) 或等待超过 SAVE_FORCE_DELAY_MS 时执行,
+// 保证这个受控的 USB 短暂停绝不随机落在游戏进行中。
 void save_loop() {
     if (!pending_flag) return;
 
-    // 先清标志: 失败不重试 (Flash 操作失败属于硬件级异常, 自动重试风险更大)
+    // 空闲窗口门控: 有按键活动时不执行 (除非等待超过上限, 防止永不提交)
+    // Require continuous idle; never force a save while keys are active.
+    if (!idle_hint) { first_pending_us = 0; return; }
+    const uint64_t now = time_us_64();
+    if (!first_pending_us) first_pending_us = now;
+    if (now - first_pending_us < 2000000) return;
+    first_pending_us = 0;
+
     pending_flag = false;
 
     printf("CONFIG SAVE: deferred flash write starting (USB pauses briefly)...\r\n");
 
+    last_save_start_us = time_us_64();
     bool ok = save_write(pending_data, pending_len);
+    last_save_end_us = time_us_64();
+
+    uint32_t dur_us = (uint32_t)(last_save_end_us - last_save_start_us);
+    if (dur_us > max_save_duration_us) max_save_duration_us = dur_us;
+
+    if (ok) {
+        save_count++;
+    } else {
+        save_fail_count++;
+    }
 
     printf(ok ? "SAVE OK\r\n" : "SAVE ERROR\r\n");
 }
+
+// 供 STATUS/PERF 输出的执行统计
+uint32_t save_get_count(void)           { return save_count; }
+uint32_t save_get_fail_count(void)      { return save_fail_count; }
+uint32_t save_get_max_duration_us(void) { return max_save_duration_us; }
+uint64_t save_get_last_start_us(void)   { return last_save_start_us; }
+uint64_t save_get_last_end_us(void)     { return last_save_end_us; }
 
 } // namespace Chuni245Tof

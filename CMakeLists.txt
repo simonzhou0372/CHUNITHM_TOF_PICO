@@ -14,7 +14,7 @@ endif()
 # ====================================================================================
 set(PICO_BOARD pico CACHE STRING "Board type")
 
-cmake_minimum_required(VERSION 3.13)
+cmake_minimum_required(VERSION 3.18)
 
 # Pull in SDK
 include(pico_sdk_import.cmake)
@@ -22,6 +22,8 @@ include(pico_sdk_import.cmake)
 project(Chuni245Tof C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
+# Only the cooperative ToF driver requires C++20 coroutine state machines.
+set_source_files_properties(src/vl53l0x.cpp PROPERTIES COMPILE_OPTIONS "-std=gnu++20")
 
 # 解决 Windows 命令行长度问题
 set(CMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS 1)
@@ -32,6 +34,7 @@ set(CMAKE_C_RESPONSE_FILE_LINK_CXX 1)
 
 # Initialize the SDK
 pico_sdk_init()
+include(cmake/PatchTinyUsb.cmake)
 
 # Source files
 set(SOURCES
@@ -70,11 +73,16 @@ target_link_libraries(Chuni245Tof
     tinyusb_board
     hardware_i2c
     hardware_flash
+    pico_flash        # flash_safe_execute: SDK 官方双核 Flash 安全机制
     pico_multicore
 )
 
-# Enable USB stdio
-pico_enable_stdio_usb(Chuni245Tof 1)
+# stdio 输出后端全部关闭 (只发送 HID 报文):
+# pico stdio_usb 的 CDC 后端在 "主机停止读取" 时每次 printf 最多阻塞 500ms
+# (PICO_STDIO_USB_STDOUT_TIMEOUT_US), 饿死 tud_task() 导致 HID 停发。
+# 关闭后 SDK 的 stdio_usb 后端 (互斥锁 + 500ms 重试循环) 完全不参与编译;
+# CDC 接口仍由 usb_descriptors.c / CFG_TUD_CDC 枚举, 仅用于接收命令。
+pico_enable_stdio_usb(Chuni245Tof 0)
 pico_enable_stdio_uart(Chuni245Tof 0)
 
 # Extra outputs (UF2, etc.)

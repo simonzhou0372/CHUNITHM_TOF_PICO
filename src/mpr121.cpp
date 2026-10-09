@@ -60,7 +60,7 @@
  * 【Barrier Mode 运行时选择】
  *   - Mode 0: 直接接触模式 (Touch=20, Release=18, CONFIG1=0x35, CONFIG2=0x02)
  *   - Mode 1: 物体间隔模式 (Touch=3, Release=2, CONFIG1=0x35, CONFIG2=0x22)
- *   - Mode 2: 物体间隔+手套模式 (Touch=3, Release=2, CONFIG1=0x25, CONFIG2=0x22)
+ *   - Mode 2: 物体间隔+手套模式 (Touch=3, Release=2, CONFIG1=0x20, CONFIG2=0x22)
  *   - 由 config_get_barrier_mode() 在运行时确定
  *
  * ==============================================================================
@@ -71,8 +71,13 @@
 #include "config.h"
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
+#include "i2c_async.h"
 #include <stdio.h>
 #include <string.h>
+// 注意: log_output.h 必须在所有 SDK/系统头之后 —— 它把 printf 宏定义为空操作,
+// 而 SDK 头中的 __printflike 会展开为 format(printf,...), 若先于头文件
+// 定义会导致解析失败
+#include "log_output.h"   // printf 总开关 (默认禁用, 只发送 HID 报文)
 
 namespace Chuni245Tof {
 
@@ -122,173 +127,127 @@ static uint32_t touch_state[3] = {0, 0, 0};
 static bool mpr_ready[3] = {false, false, false};
 static uint32_t i2c_error_count[3] = {0, 0, 0};  // I2C 错误计数
 
-// Write byte to MPR121 with specified timeout
-// Used during initialization (longer timeout OK, only runs once)
-static bool mpr_write_byte(uint8_t addr, uint8_t reg, uint8_t value) {
-    uint8_t buf[2] = {reg, value};
-    int ret = i2c_write_blocking_until(I2C0_PORT, addr, buf, 2, false,
-                                        time_us_64() + MPR121_I2C_INIT_TIMEOUT_US);
-    return ret >= 0;
-}
-
-// Read byte from MPR121 with specified timeout
-// Used during initialization (longer timeout OK, only runs once)
-static bool mpr_read_byte(uint8_t addr, uint8_t reg, uint8_t *value) {
-    int ret = i2c_write_blocking_until(I2C0_PORT, addr, &reg, 1, true,
-                                        time_us_64() + MPR121_I2C_INIT_TIMEOUT_US);
-    if (ret < 0) return false;
-
-    ret = i2c_read_blocking_until(I2C0_PORT, addr, value, 1, false,
-                                   time_us_64() + MPR121_I2C_INIT_TIMEOUT_US);
-    return ret >= 0;
-}
-
-// Read 16-bit value from MPR121 (little-endian)
-// Used during initialization (longer timeout OK, only runs once)
-static bool mpr_read_word(uint8_t addr, uint8_t reg, uint16_t *value) {
-    uint8_t buf[2];
-    int ret = i2c_write_blocking_until(I2C0_PORT, addr, &reg, 1, true,
-                                        time_us_64() + MPR121_I2C_INIT_TIMEOUT_US);
-    if (ret < 0) return false;
-
-    ret = i2c_read_blocking_until(I2C0_PORT, addr, buf, 2, false,
-                                   time_us_64() + MPR121_I2C_INIT_TIMEOUT_US);
-    if (ret < 0) return false;
-
-    *value = buf[0] | (buf[1] << 8);  // Little-endian
-    return true;
-}
-
-// Initialize single MPR121
-static bool mpr_init_single(uint8_t addr, int index) {
-    printf("  MPR%d [0x%02X]: ", index + 1, addr);
-
-    // Soft reset
-    mpr_write_byte(addr, MPR121_SOFTRESET, 0x63);
-    sleep_ms(2);
-
-    // Check if device responds
-    uint8_t check = 0;
-    if (!mpr_read_byte(addr, 0x5C, &check)) {
-        printf("NO RESPONSE\n");
-        return false;
+// Core0-only transaction engine. A pending transaction yields to USB/HID.
+static AsyncI2c mpr_bus(I2C0_PORT);
+enum IoOwner { IO_NONE, IO_COMMAND, IO_TOUCH };
+static IoOwner io_owner = IO_NONE;
+enum IoResult { IO_ERROR = -1, IO_PENDING = 0, IO_OK = 1 };
+static IoResult command_io(uint8_t addr, uint8_t reg, uint8_t value, uint8_t* read) {
+    if (io_owner == IO_NONE) {
+        if (mpr_bus.busy()) return IO_PENDING;
+        uint8_t bytes[2] = {reg, value};
+        if (!mpr_bus.start(addr, bytes, read ? 1 : 2, read ? 1 : 0,
+                           MPR121_I2C_RUNTIME_TIMEOUT_US)) return IO_ERROR;
+        io_owner = IO_COMMAND;
+        return IO_PENDING;
     }
+    if (io_owner != IO_COMMAND || mpr_bus.busy()) return IO_PENDING;
+    io_owner = IO_NONE;
+    if (mpr_bus.result() != 2) return IO_ERROR;
+    if (read) *read = mpr_bus.data()[0];
+    return IO_OK;
+}
+static IoResult mpr_rt_write_byte(uint8_t addr, uint8_t reg, uint8_t val) {
+    return command_io(addr, reg, val, nullptr);
+}
+static IoResult mpr_rt_read_byte(uint8_t addr, uint8_t reg, uint8_t* val) {
+    return command_io(addr, reg, 0, val);
+}
+static bool cold_boot = true;
+static uint64_t boot_deadline = 0;
 
-    if (check == 0xFF || check == 0x00) {
-        printf("INVALID (0x%02X)\n", check);
-        return false;
-    }
-
-    // ===== BARRIER MODE 配置 (运行时确定) =====
+// 计算单芯片初始化寄存器值 (barrier mode + 用户 cfg)
+// mpr_init_single (上电路径) 与异步 RESET 状态机共用, 保证两条路径
+// 写入的寄存器序列永远一致
+static void mpr_compute_config(uint8_t *touch_thr, uint8_t *release_thr,
+                               uint8_t *config1, uint8_t *config2) {
     uint8_t barrier_mode = config_get_barrier_mode();
-
-    // 根据 barrier mode 设置 Touch/Release 阈值和 CONFIG1/CONFIG2
-    uint8_t touch_thr, release_thr;
-    uint8_t config1, config2;
 
     switch (barrier_mode) {
         case 0: // Mode 0: 直接接触
-            touch_thr = 20; release_thr = 18;
-            config1 = 0x35; config2 = 0x02;
+            *touch_thr = 20; *release_thr = 18;
+            *config1 = 0x35; *config2 = 0x02;
             break;
         case 1: // Mode 1: 物体间隔
-            touch_thr = 3; release_thr = 2;
-            config1 = 0x35; config2 = 0x22;
+            *touch_thr = 3; *release_thr = 2;
+            *config1 = 0x35; *config2 = 0x22;
             break;
         case 2: // Mode 2: 物体间隔+手套
         default:
-            touch_thr = 3; release_thr = 2;
-            config1 = 0x25; config2 = 0x22;
+            *touch_thr = 3; *release_thr = 2;
+            *config1 = 0x20; *config2 = 0x22;
             break;
     }
 
     // 如果 cfg 已初始化，使用 Flash 中的用户配置
     if (cfg) {
-        touch_thr = cfg->touch_threshold;
-        release_thr = cfg->release_threshold;
+        *touch_thr = cfg->touch_threshold;
+        *release_thr = cfg->release_threshold;
     }
-
-    // 写入阈值
-    for (int i = 0; i < 12; i++) {
-        mpr_write_byte(addr, MPR121_TOUCHTH_L + i * 2, touch_thr);
-        mpr_write_byte(addr, MPR121_RELEASETH_L + i * 2, release_thr);
-    }
-
-    // Filter configuration
-    mpr_write_byte(addr, MPR121_MHDR, 0x01);
-    mpr_write_byte(addr, MPR121_NHDR, 0x01);
-    mpr_write_byte(addr, MPR121_NCLR, 0x0E);
-    mpr_write_byte(addr, MPR121_FDLR, 0x00);
-    mpr_write_byte(addr, MPR121_MHDF, 0x01);
-    mpr_write_byte(addr, MPR121_NHDF, 0x05);
-    mpr_write_byte(addr, MPR121_NCLF, 0x01);
-    mpr_write_byte(addr, MPR121_FDLF, 0x00);
-    mpr_write_byte(addr, MPR121_NHDT, 0x00);
-    mpr_write_byte(addr, MPR121_NCLT, 0x00);
-    mpr_write_byte(addr, MPR121_FDLT, 0x00);
-    mpr_write_byte(addr, MPR121_DEBOUNCE, 0x00);
-
-    // 写入 CONFIG1/CONFIG2
-    mpr_write_byte(addr, MPR121_CONFIG1, config1);
-    mpr_write_byte(addr, MPR121_CONFIG2, config2);
-
-    // Enable electrodes
-    mpr_write_byte(addr, MPR121_ECR, 0x8C);
-    sleep_ms(100);
-
-    // 一行输出所有关键信息
-    printf("OK (BMode=%d THR=%d/%d CFG=0x%02X/0x%02X)\n",
-           barrier_mode, touch_thr, release_thr, config1, config2);
-    return true;
 }
 
 void mpr121_init() {
-    printf("[MPR121] Initializing I2C0...\n");
-
-    // Initialize I2C0 (MPR121 is on I2C0)
-    i2c_init(I2C0_PORT, 400 * 1000);
     gpio_set_function(I2C0_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C0_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C0_SDA);
     gpio_pull_up(I2C0_SCL);
+    mpr_bus.init(400000);
+    boot_deadline = time_us_64() + 10000;
+    cold_boot = true;
+}
 
-    sleep_ms(10);
+// CONFIG / RESET and cold startup share one asynchronous I2C owner.
+// Each step submits/checks a transfer. The 500us deadline spans loop iterations;
+// it is not a busy-wait budget. Reset/settling waits also yield to USB.
 
-    // Initialize all MPR121 chips.
-    //
-    // 【零运行时恢复原则】本固件没有运行时 MPR121 恢复/下线机制:
-    //   - mpr_ready 一旦置位, 运行期永不撤销; I2C 瞬时失败仅计数并保留
-    //     旧状态, 总线恢复后下一次轮询自动续读, 不存在 "误判掉线" 的
-    //     运行时路径。
-    //   - 下面的重试仅发生在上电初始化阶段: 防止上电瞬间芯片尚未就绪
-    //     或响应寄存器读到瞬时 0x00/0xFF 时被误判失效 (mpr_ready=false
-    //     会永久跳过该设备 —— 这是唯一会造成 "误判掉线且无法重启" 的
-    //     冷启动路径)。重试 3 次后仍失败才接受, 等待用户手动 RESET。
-    printf("[MPR121] Initializing sensors:\n");
-    for (int i = 0; i < 3; i++) {
-        bool ok = false;
-        for (int attempt = 0; attempt < 3 && !ok; attempt++) {
-            if (attempt > 0) {
-                printf("  MPR%d [0x%02X]: retry %d/2\n", i + 1, mpr_addr[i], attempt);
-                sleep_ms(20);
-            }
-            ok = mpr_init_single(mpr_addr[i], i);
-        }
-        mpr_ready[i] = ok;
+typedef enum {
+    THR_IDLE = 0,        // 无操作
+    THR_APPLY,           // 阈值下发进行中 (72 步)
+    THR_RESET_WRITE,     // [RESET] 软复位写
+    THR_RESET_WAIT1,     // [RESET] 等待复位完成 (≥3ms, deadline 判定)
+    THR_RESET_CHECK,     // [RESET] 读 0x5C 校验响应
+    THR_RESET_INIT,      // [RESET] 重初始化写序列 (39 步)
+    THR_RESET_WAIT2,     // [RESET] 等待 ECR 生效 (≥100ms, deadline 判定)
+} thr_state_t;
+
+static thr_state_t thr_state = THR_IDLE;
+static bool thresholds_pending = false;
+static uint8_t  thr_dev = 0;          // 当前设备
+static uint16_t thr_step = 0;         // 当前步 (THR_APPLY: 0..71 / THR_RESET_INIT: 0..38)
+static uint8_t  thr_touch = 0, thr_release = 0;
+static uint8_t  thr_config1 = 0, thr_config2 = 0;
+static uint64_t thr_deadline = 0;
+
+// RESET 重初始化写序列 (与 mpr_init_single 完全一致, 在 THR_RESET_CHECK 生成)
+typedef struct { uint8_t reg; uint8_t val; } mpr_reg_pair_t;
+#define MPR_INIT_SEQ_LEN 39
+static mpr_reg_pair_t thr_init_seq[MPR_INIT_SEQ_LEN];
+
+static void build_init_sequence() {
+    uint8_t seq = 0;
+    for (int i = 0; i < 12; i++) {
+        thr_init_seq[seq++] = { (uint8_t)(MPR121_TOUCHTH_L + i * 2), thr_touch };
+        thr_init_seq[seq++] = { (uint8_t)(MPR121_RELEASETH_L + i * 2), thr_release };
     }
+    thr_init_seq[seq++] = { MPR121_MHDR,     0x01 };
+    thr_init_seq[seq++] = { MPR121_NHDR,     0x01 };
+    thr_init_seq[seq++] = { MPR121_NCLR,     0x0E };
+    thr_init_seq[seq++] = { MPR121_FDLR,     0x00 };
+    thr_init_seq[seq++] = { MPR121_MHDF,     0x01 };
+    thr_init_seq[seq++] = { MPR121_NHDF,     0x05 };
+    thr_init_seq[seq++] = { MPR121_NCLF,     0x01 };
+    thr_init_seq[seq++] = { MPR121_FDLF,     0x00 };
+    thr_init_seq[seq++] = { MPR121_NHDT,     0x00 };
+    thr_init_seq[seq++] = { MPR121_NCLT,     0x00 };
+    thr_init_seq[seq++] = { MPR121_FDLT,     0x00 };
+    thr_init_seq[seq++] = { MPR121_DEBOUNCE, 0x00 };
+    thr_init_seq[seq++] = { MPR121_CONFIG1,  thr_config1 };
+    thr_init_seq[seq++] = { MPR121_CONFIG2,  thr_config2 };
+    thr_init_seq[seq++] = { MPR121_ECR,      0x8C };
+}
 
-    int count = 0;
-    for (int i = 0; i < 3; i++) {
-        if (mpr_ready[i]) count++;
-    }
-    printf("[MPR121] %d/3 sensors initialized\n", count);
-
-    // 等待所有传感器 Baseline 稳定
-    if (count > 0) {
-        printf("[MPR121] Waiting for baseline stabilization...\n");
-        sleep_ms(500);  // 额外等待 500ms
-        printf("[MPR121] Ready.\n");
-    }
+bool mpr121_op_busy() {
+    return cold_boot || thresholds_pending || thr_state != THR_IDLE;
 }
 
 void mpr121_set_thresholds(uint8_t touch_thr, uint8_t release_thr) {
@@ -310,88 +269,200 @@ void mpr121_set_thresholds(uint8_t touch_thr, uint8_t release_thr) {
         }
     }
 
-    for (int dev = 0; dev < 3; dev++) {
-        if (!mpr_ready[dev]) continue;
-        for (int ch = 0; ch < 12; ch++) {
-            mpr_write_byte(mpr_addr[dev], MPR121_TOUCHTH_L + ch * 2, touch_thr);
-            mpr_write_byte(mpr_addr[dev], MPR121_RELEASETH_L + ch * 2, release_thr);
-        }
-    }
-
-    printf("[MPR121] Thresholds set: Touch=%d, Release=%d (hysteresis=%d)\n",
+    // A new CONFIG during an in-flight write needs another complete pass;
+    // otherwise channels already written would retain the previous value.
+    thr_touch = touch_thr;
+    thr_release = release_thr;
+    thresholds_pending = true;
+    printf("[MPR121] Threshold apply queued (async): Touch=%d, Release=%d (hysteresis=%d)\n",
            touch_thr, release_thr, touch_thr - release_thr);
 }
 
-/*
- * mpr121_update() - Non-Blocking Touch Status Read
- *
- * ==============================================================================
- * 架构说明
- * ==============================================================================
- *
- * 【核心原则】
- * MPR121是比AIR更高优先级的实时输入，但MPR121的故障不能拖死整个Core 0。
- *
- * 【设计目标】
- * 1. MPR121正常时：保持高刷新率，快速读取（每个设备<1ms）
- * 2. MPR121异常时：快速失败，不阻塞AIR和USB HID
- * 3. 单次调用总执行时间有界（<3ms，即使所有设备都失败）
- *
- * 【实现方式】
- * - 使用极短timeout（500us）
- * - 对每个MPR121设备：
- *   - 尝试I2C write
- *   - 失败 → 立即跳过该设备，继续下一个
- *   - 成功 → 尝试I2C read
- *   - 失败 → 立即跳过该设备，继续下一个
- *   - 成功 → 更新touch_state
- * - 不retry，不等待
- * - 失败的设备保留上一次的有效状态
- *
- * 【最坏情况】
- * 如果所有3个MPR121的I2C都失败：
- * - 每个设备：1次write timeout + 1次read timeout
- * - 总时间：3 × 2 × 500us = 3ms
- * - 远低于原来的60ms
- *
- * ==============================================================================
- */
-void mpr121_update() {
-    // 遍历所有MPR121设备
-    for (int i = 0; i < 3; i++) {
-        // 检查设备是否就绪
-        if (!mpr_ready[i]) {
-            // 设备未初始化，保持旧状态（0）
-            continue;
-        }
-
-        // 准备读取touch status寄存器
-        uint8_t status[2] = {0, 0};
-        uint8_t reg = MPR121_TOUCHSTATUS_L;
-
-        // 第一步：I2C write（发送寄存器地址）
-        // 使用极短timeout，失败立即跳过
-        int ret = i2c_write_blocking_until(I2C0_PORT, mpr_addr[i], &reg, 1, true,
-                                            time_us_64() + MPR121_I2C_UPDATE_TIMEOUT_US);
-        if (ret < 0) {
-            // I2C写入失败，记录错误，保持旧状态，继续下一个设备
-            i2c_error_count[i]++;
-            continue;  // 快速失败，不阻塞
-        }
-
-        // 第二步：I2C read（读取touch status）
-        // 使用极短timeout，失败立即跳过
-        ret = i2c_read_blocking_until(I2C0_PORT, mpr_addr[i], status, 2, false,
-                                       time_us_64() + MPR121_I2C_UPDATE_TIMEOUT_US);
-        if (ret < 0) {
-            // I2C读取失败，记录错误，保持旧状态，继续下一个设备
-            i2c_error_count[i]++;
-            continue;  // 快速失败，不阻塞
-        }
-
-        // 成功读取，更新touch_state
-        touch_state[i] = status[0] | ((uint32_t)status[1] << 8);
+//------------------------------------------------------------------------------
+// 状态机推进: 每次调用最多 1 个 I2C 事务 (≤500us)。
+// 由 mpr121_update() 在主循环中每轮调用。
+//------------------------------------------------------------------------------
+static void mpr_task_step_impl(void) {
+    if (thr_state == THR_IDLE && thresholds_pending) {
+        thresholds_pending = false;
+        thr_state = THR_APPLY;
+        thr_step = 0;
     }
+    switch (thr_state) {
+        case THR_IDLE:
+            return;
+
+        case THR_APPLY: {
+            // 步进映射: step 0..71 → (dev = step/24, rem = step%24,
+            //   rem 偶数 = TOUCHTH, rem 奇数 = RELEASETH, ch = rem/2)
+            while (thr_step < 72 && !mpr_ready[thr_step / 24]) {
+                thr_step += 24;           // 跳过未就绪设备的 24 步
+            }
+            if (thr_step >= 72) {
+                thr_state = THR_IDLE;
+                return;
+            }
+            uint8_t dev = thr_step / 24;
+            uint8_t rem = thr_step % 24;
+            uint8_t reg = (rem & 1) ? (uint8_t)(MPR121_RELEASETH_L + (rem >> 1) * 2)
+                                    : (uint8_t)(MPR121_TOUCHTH_L + (rem >> 1) * 2);
+            uint8_t val = (rem & 1) ? thr_release : thr_touch;
+            IoResult result = mpr_rt_write_byte(mpr_addr[dev], reg, val);
+            if (result == IO_PENDING) return;
+            if (result == IO_ERROR) {
+                i2c_error_count[dev]++;
+                // 瞬时失败不回滚不重试: 后续步骤继续推进, 失败寄存器
+                // 保持旧值 (与轮询路径 "失败保留旧状态" 一致)
+            }
+            thr_step++;
+            return;
+        }
+
+        case THR_RESET_WRITE: {
+            // 与旧实现一致: RESET 只重置已就绪设备
+            while (thr_dev < 3 && !mpr_ready[thr_dev]) thr_dev++;
+            if (thr_dev >= 3) {
+                thr_state = THR_IDLE;
+                printf("[MPR121] Baseline reset complete\n");
+                return;
+            }
+            IoResult result = mpr_rt_write_byte(mpr_addr[thr_dev], MPR121_SOFTRESET, 0x63);
+            if (result == IO_PENDING) return;
+            if (result == IO_ERROR) {
+                i2c_error_count[thr_dev]++;
+                // 软复位写失败: 芯片无响应, 标记未就绪并跳到下一设备
+                mpr_ready[thr_dev] = false;
+                thr_dev++;
+                return;
+            }
+            thr_deadline = time_us_64() + 3000;  // 数据手册 2ms + 余量
+            thr_state = THR_RESET_WAIT1;
+            return;
+
+        }
+        case THR_RESET_WAIT1:
+            // deadline 判定代替 sleep_ms: 等待期间主循环正常运转
+            if (time_us_64() < thr_deadline) return;
+            thr_state = THR_RESET_CHECK;
+            return;
+
+        case THR_RESET_CHECK: {
+            uint8_t check = 0;
+            IoResult result = mpr_rt_read_byte(mpr_addr[thr_dev], 0x5C, &check);
+            if (result == IO_PENDING) return;
+            if (result == IO_ERROR ||
+                check == 0xFF || check == 0x00) {
+                // 与 mpr_init_single 的冷启动判定完全一致
+                mpr_ready[thr_dev] = false;
+                thr_dev++;
+                thr_state = THR_RESET_WRITE;
+                return;
+            }
+            // 生成重初始化写序列 (与 mpr_init_single 寄存器序列一致;
+            // 阈值用最近一次 CONFIG/DEFAULT 的值)
+            build_init_sequence();
+            thr_step = 0;
+            thr_state = THR_RESET_INIT;
+            return;
+        }
+
+        case THR_RESET_INIT: {
+            IoResult result = mpr_rt_write_byte(mpr_addr[thr_dev], thr_init_seq[thr_step].reg,
+                                                 thr_init_seq[thr_step].val);
+            if (result == IO_PENDING) return;
+            if (result == IO_ERROR) {
+                i2c_error_count[thr_dev]++;
+            }
+            thr_step++;
+            if (thr_step >= MPR_INIT_SEQ_LEN) {
+                thr_deadline = time_us_64() + 100000;  // 旧 mpr_init_single 的 sleep_ms(100)
+                thr_state = THR_RESET_WAIT2;
+            }
+            return;
+
+        }
+        case THR_RESET_WAIT2:
+            if (time_us_64() < thr_deadline) return;
+            touch_state[thr_dev] = 0;
+            thr_dev++;
+            thr_state = THR_RESET_WRITE;   // 下一设备 (内部会跳过未就绪)
+            return;
+    }
+}
+
+void mpr121_task_step() {
+    mpr_task_step_impl();
+}
+
+// Round-robin complete register transfers; only successful reads publish touch
+// state. A failed transfer retains the previous state and yields to USB.
+// Startup deadlines replace sleep_ms(2/20/100/500). No USB blackout.
+static void boot_step() {
+    enum Phase { Reset, WaitReset, Check, Program, WaitRun, Next, Settle };
+    static Phase phase = Reset;
+    static uint8_t dev = 0, attempt = 0, reg_index = 0;
+    const uint64_t now = time_us_64();
+    if (now < boot_deadline || mpr_bus.busy()) return;
+    IoResult result;
+    bool failed = false;
+    switch (phase) {
+    case Reset:
+        result = mpr_rt_write_byte(mpr_addr[dev], MPR121_SOFTRESET, 0x63);
+        if (result == IO_PENDING) return;
+        if (result == IO_ERROR) { failed = true; break; }
+        boot_deadline = now + 2000; phase = WaitReset; return;
+    case WaitReset: phase = Check; return;
+    case Check: {
+        uint8_t check = 0;
+        result = mpr_rt_read_byte(mpr_addr[dev], 0x5C, &check);
+        if (result == IO_PENDING) return;
+        if (result == IO_ERROR || check == 0 || check == 0xff) { failed = true; break; }
+        mpr_compute_config(&thr_touch, &thr_release, &thr_config1, &thr_config2);
+        build_init_sequence();
+        reg_index = 0; phase = Program; return;
+    }
+    case Program:
+        result = mpr_rt_write_byte(mpr_addr[dev], thr_init_seq[reg_index].reg, thr_init_seq[reg_index].val);
+        if (result == IO_PENDING) return;
+        if (result == IO_ERROR) { failed = true; break; }
+        if (++reg_index == MPR_INIT_SEQ_LEN) { boot_deadline = now + 100000; phase = WaitRun; }
+        return;
+    case WaitRun: mpr_ready[dev] = true; phase = Next; return;
+    case Next:
+        attempt = 0;
+        if (++dev == 3) { boot_deadline = now + 500000; phase = Settle; }
+        else phase = Reset;
+        return;
+    case Settle: cold_boot = false; return;
+    }
+    if (failed) {
+        ++i2c_error_count[dev];
+        if (++attempt < 3) { phase = Reset; boot_deadline = now + 20000; }
+        else { mpr_ready[dev] = false; phase = Next; }
+    }
+}
+
+void mpr121_update() {
+    static uint8_t rr_index = 0, reading_device = 0;
+    mpr_bus.step();
+    if (cold_boot) { boot_step(); return; }
+    if (io_owner == IO_TOUCH) {
+        if (mpr_bus.busy()) return;
+        if (mpr_bus.result() == 3) {
+            const uint8_t* status = mpr_bus.data();
+            touch_state[reading_device] = status[0] | ((uint32_t)status[1] << 8);
+        } else ++i2c_error_count[reading_device];
+        io_owner = IO_NONE;
+        return;
+    }
+    mpr121_task_step();
+    if (io_owner != IO_NONE || mpr_bus.busy()) return;
+    reading_device = rr_index;
+    rr_index = (rr_index + 1) % 3;
+    if (!mpr_ready[reading_device]) return;
+    const uint8_t reg = MPR121_TOUCHSTATUS_L;
+    if (mpr_bus.start(mpr_addr[reading_device], &reg, 1, 2, MPR121_I2C_UPDATE_TIMEOUT_US))
+        io_owner = IO_TOUCH;
 }
 
 uint32_t mpr121_get_touch_state(uint8_t device) {
@@ -416,451 +487,26 @@ uint32_t mpr121_get_error_count(uint8_t device) {
 }
 
 void mpr121_debug_print() {
-    printf("\n========== MPR121 Debug ==========\n");
-
-    // 显示 I2C 错误计数
-    printf("I2C Errors: MPR1=%lu, MPR2=%lu, MPR3=%lu\n",
-           i2c_error_count[0], i2c_error_count[1], i2c_error_count[2]);
-
-    for (int dev = 0; dev < 3; dev++) {
-        if (!mpr_ready[dev]) {
-            printf("MPR%d: NOT READY\n", dev + 1);
-            continue;
-        }
-
-        uint8_t addr = mpr_addr[dev];
-        printf("\n--- MPR%d [0x%02X] ---\n", dev + 1, addr);
-
-        // ===== 读取并显示所有 E0~E11 的阈值寄存器 =====
-        // 注意：阈值寄存器独立于 baseline/filtered 数据区域，
-        // E0~E11 全部可读可写，不受 baseline 可读范围限制（仅 E0~E5 baseline 可读）
-        printf("| CH | Touch TH | Release TH | Status |\n");
-        printf("|----|----------|------------|--------|\n");
-        for (int ch = 0; ch < 12; ch++) {
-            uint8_t touch_th = 0, release_th = 0;
-            mpr_read_byte(addr, MPR121_TOUCHTH_L + ch * 2, &touch_th);
-            mpr_read_byte(addr, MPR121_RELEASETH_L + ch * 2, &release_th);
-            bool touched = (touch_state[dev] >> ch) & 1;
-            printf("| E%-2d| %-8d | %-10d | %-6s|\n",
-                   ch, touch_th, release_th, touched ? "TOUCH" : "");
-        }
-
-        // ===== 显示 E0~E5 的 filtered/baseline/delta（仅 E0~E5 baseline 可读） =====
-        printf("\nCH  Baseline Filtered  Delta  (E0~E5 only, E6+ baseline unreadable)\n");
-
-        // E6+ baseline overlaps with filter config registers, unreadable.
-        // Only show E0-E5 which have reliable filtered + baseline data.
-        int max_ch = MPR121_MAX_READABLE_BASELINE_CH;
-        for (int ch = 0; ch <= max_ch; ch++) {
-            // Packed layout: filtered = 0x04 + ch*2, baseline = 0x1E + ch*2
-            uint8_t filtered_reg = MPR121_ELE0_FILTERED + ch * 2;
-            uint8_t baseline_reg = MPR121_ELE0_BASELINE + ch * 2;
-
-            uint16_t filtered_raw = 0, baseline_raw = 0;
-            bool ok1 = mpr_read_word(addr, filtered_reg, &filtered_raw);
-            bool ok2 = mpr_read_word(addr, baseline_reg, &baseline_raw);
-
-            if (!ok1 || !ok2) {
-                printf("%2d: READ ERROR\n", ch);
-                continue;
-            }
-
-            uint16_t baseline = baseline_raw & 0x03FF;  // 10-bit
-            uint16_t filtered = filtered_raw & 0x0FFF;  // 12-bit
-
-            // Delta = FilteredData - Baseline
-            // 重要：MPR121 硬件内部 Touch 判定基于此 delta 值：
-            //   Touch:   delta < -touch_threshold (filtered < baseline - touch_threshold)
-            //   Release: delta > -release_threshold (filtered > baseline - release_threshold)
-            // 注意：debug delta 只是观测值，实际 Touch 状态来自 MPR121_TOUCHSTATUS 寄存器。
-            // 不要直接用 delta 与 touch_threshold 比较来判断 Touch 状态！
-            int16_t delta = (int16_t)filtered - (int16_t)baseline;
-            bool touched = (touch_state[dev] >> ch) & 1;
-
-            printf("%2d:  %5d    %5d   %+5d   %d\n",
-                   ch, baseline, filtered, delta, touched ? 1 : 0);
-        }
-    }
-
-    printf("\n==================================\n");
+    for (int i = 0; i < 3; ++i)
+        printf("MPR%u touch=%lu errors=%lu\n", i, touch_state[i], i2c_error_count[i]);
 }
 
 // Reset baseline for all MPR121 chips (soft reset)
+// ★ 异步: 只启动状态机, 不做任何 I2C / sleep (旧实现同步执行
+//   3 × (软复位 + sleep 2ms + 39 次初始化写 + sleep 100ms) ≈ 1.5s,
+//   期间主循环完全停摆)
 void mpr121_reset_baseline() {
-    printf("[MPR121] Resetting baseline...\n");
-    for (int i = 0; i < 3; i++) {
-        if (!mpr_ready[i]) continue;
-
-        // Soft reset
-        mpr_write_byte(mpr_addr[i], MPR121_SOFTRESET, 0x63);
-        sleep_ms(2);
-
-        // Re-initialize
-        mpr_ready[i] = mpr_init_single(mpr_addr[i], i);
-
-        // Clear touch state
-        touch_state[i] = 0;
+    if (thr_state == THR_IDLE) {
+        mpr_compute_config(&thr_touch, &thr_release, &thr_config1, &thr_config2);
+        thr_state = THR_RESET_WRITE;
+        thr_dev = 0;
+        thr_step = 0;
     }
-    printf("[MPR121] Baseline reset complete\n");
+    printf("[MPR121] Baseline reset queued (async)\n");
 }
-
-// ============================================================================
-// MPR121 Debug System
-// ============================================================================
-//
-// Design:
-//   - Cycling I2C reads: one (dev, ch) pair per MPR121_DEBUG_SAMPLE_DIVIDER
-//     loop iterations. This keeps per-loop overhead to ~2 I2C word reads
-//     instead of reading all electrodes at once.
-//   - Event detection uses touch_state (already read every loop for free).
-//     On state transition, filtered/baseline is read on-demand for that ch.
-//   - Stats table printed every MPR121_DEBUG_STAT_INTERVAL_MS.
-//   - All code compiles to nothing when DEBUG_MPR121 == 0.
-//
-// Delta formula (matches existing mpr121_debug_print):
-//   delta = (int16_t)(filtered & 0x0FFF) - (int16_t)(baseline & 0x03FF)
-//   Negative = finger present (filtered < baseline).
-// ============================================================================
 
 #if DEBUG_MPR121
-
-// Clamp electrode range to valid bounds.
-// Max readable baseline channel is MPR121_MAX_READABLE_BASELINE_CH (5),
-// because E6+ baseline addresses overlap with filter config registers.
-#if MPR121_DEBUG_FIRST_ELECTRODE < 0
-#undef MPR121_DEBUG_FIRST_ELECTRODE
-#define MPR121_DEBUG_FIRST_ELECTRODE 0
+void mpr121_debug_init() { mpr121_debug_print(); }
+void mpr121_debug_tick() {} // diagnostics use cached state only
 #endif
-#if MPR121_DEBUG_LAST_ELECTRODE > MPR121_MAX_READABLE_BASELINE_CH
-#undef MPR121_DEBUG_LAST_ELECTRODE
-#define MPR121_DEBUG_LAST_ELECTRODE MPR121_MAX_READABLE_BASELINE_CH
-#endif
-#if MPR121_DEBUG_SAMPLE_DIVIDER < 1
-#undef MPR121_DEBUG_SAMPLE_DIVIDER
-#define MPR121_DEBUG_SAMPLE_DIVIDER 1
-#endif
-
-struct mpr121_dbg_ch_t {
-    uint16_t filtered;
-    uint16_t baseline;
-    int16_t  delta;
-    // min/max accumulators (reset after each stats print)
-    uint16_t filt_min;
-    uint16_t filt_max;
-    int16_t  delta_min;
-    int16_t  delta_max;
-    bool     has_sample;  // true if at least one sample taken since reset
-};
-
-static struct mpr121_dbg_ch_t dbg_ch[3][12];
-static uint32_t dbg_prev_touch[3] = {0, 0, 0};
-static uint64_t dbg_stat_last_us  = 0;
-static uint32_t dbg_loop_ctr      = 0;
-// Cycling read position
-static uint8_t  dbg_read_dev = 0;
-static uint8_t  dbg_read_ch  = MPR121_DEBUG_FIRST_ELECTRODE;
-
-// Read filtered + baseline for one (dev, ch) pair and update accumulators.
-// Uses the SAME register addresses and delta formula as mpr121_debug_print().
-// Packed layout: filtered = 0x04 + ch*2, baseline = 0x1E + ch*2.
-// ch must be <= MPR121_MAX_READABLE_BASELINE_CH (5), since E6+ baseline
-// addresses overlap with filter config registers.
-static void dbg_sample_channel(uint8_t dev, uint8_t ch) {
-    if (!mpr_ready[dev]) return;
-    if (ch > MPR121_MAX_READABLE_BASELINE_CH) return;
-    uint8_t addr = mpr_addr[dev];
-    uint8_t filt_reg = MPR121_ELE0_FILTERED + ch * 2;
-    uint8_t base_reg = MPR121_ELE0_BASELINE + ch * 2;
-
-    uint16_t filt_raw = 0, base_raw = 0;
-    bool ok1 = mpr_read_word(addr, filt_reg, &filt_raw);
-    bool ok2 = mpr_read_word(addr, base_reg, &base_raw);
-    if (!ok1 || !ok2) return;
-
-    uint16_t filtered = filt_raw & 0x0FFF;   // 12-bit
-    uint16_t baseline = base_raw & 0x03FF;   // 10-bit
-    int16_t  delta    = (int16_t)filtered - (int16_t)baseline;
-
-    struct mpr121_dbg_ch_t *c = &dbg_ch[dev][ch];
-    c->filtered = filtered;
-    c->baseline = baseline;
-    c->delta    = delta;
-
-    if (!c->has_sample) {
-        c->filt_min  = filtered;
-        c->filt_max  = filtered;
-        c->delta_min = delta;
-        c->delta_max = delta;
-        c->has_sample = true;
-    } else {
-        if (filtered < c->filt_min) c->filt_min = filtered;
-        if (filtered > c->filt_max) c->filt_max = filtered;
-        if (delta < c->delta_min)   c->delta_min = delta;
-        if (delta > c->delta_max)   c->delta_max = delta;
-    }
-}
-
-// Reset min/max accumulators for all monitored channels
-static void dbg_reset_stats() {
-    for (int dev = 0; dev < 3; dev++) {
-        for (int ch = 0; ch < 12; ch++) {
-            dbg_ch[dev][ch].filt_min   = UINT16_MAX;
-            dbg_ch[dev][ch].filt_max   = 0;
-            dbg_ch[dev][ch].delta_min  = INT16_MAX;
-            dbg_ch[dev][ch].delta_max  = INT16_MIN;
-            dbg_ch[dev][ch].has_sample = false;
-        }
-    }
-}
-
-// Advance cycling read position to next (dev, ch) in range
-static void dbg_advance_pos() {
-    dbg_read_ch++;
-    if (dbg_read_ch > MPR121_DEBUG_LAST_ELECTRODE) {
-        dbg_read_ch = MPR121_DEBUG_FIRST_ELECTRODE;
-        dbg_read_dev++;
-        if (dbg_read_dev >= 3) {
-            dbg_read_dev = 0;
-        }
-    }
-}
-
-// Print the header + column labels for a device table
-static void dbg_print_table_header(int dev) {
-    int first = MPR121_DEBUG_FIRST_ELECTRODE;
-    int last  = MPR121_DEBUG_LAST_ELECTRODE;
-
-    printf("| Param      |");
-    for (int ch = first; ch <= last; ch++) {
-        printf(" E%-3d|", ch);
-    }
-    printf("\r\n|------------|");
-    for (int ch = first; ch <= last; ch++) {
-        (void)ch;
-        printf("------|");
-    }
-    printf("\r\n");
-}
-
-// ---- Public API ----
-
-void mpr121_debug_init() {
-    printf("\r\n");
-    printf("[MPR121 CONFIG] =================================================\r\n");
-
-    for (int dev = 0; dev < 3; dev++) {
-        if (!mpr_ready[dev]) {
-            printf("\r\nMPR%d [0x%02X]: NOT READY\r\n", dev + 1, mpr_addr[dev]);
-            continue;
-        }
-        uint8_t addr = mpr_addr[dev];
-
-        // Read back global config registers (0x5B-0x5E, safely above electrode data)
-        uint8_t config1 = 0, config2 = 0, ecr = 0, debounce = 0;
-        mpr_read_byte(addr, MPR121_CONFIG1, &config1);
-        mpr_read_byte(addr, MPR121_CONFIG2, &config2);
-        mpr_read_byte(addr, MPR121_ECR,     &ecr);
-        mpr_read_byte(addr, MPR121_DEBOUNCE,&debounce);
-
-        printf("\r\n--- MPR%d [0x%02X] ---\r\n", dev + 1, addr);
-        printf("CONFIG1=0x%02X  CONFIG2=0x%02X  ECR=0x%02X  DEBOUNCE=0x%02X\r\n",
-               config1, config2, ecr, debounce);
-
-        // Filter configuration values are the ones written during init.
-        // We print known values because reading back 0x2B-0x35 would return
-        // filter config, not electrode data (addresses overlap).
-        printf("Filter (Rising) : MHDR=0x01 NHDR=0x01 NCLR=0x0E FDLR=0x00\r\n");
-        printf("Filter (Falling): MHDF=0x01 NHDF=0x05 NCLF=0x01 FDLF=0x00\r\n");
-        printf("Filter (Touched): NHDT=0x00 NCLT=0x00 FDLT=0x00\r\n");
-
-        // ===== 显示所有 E0~E11 的阈值寄存器（不受 baseline 可读范围限制） =====
-        // 阈值寄存器地址：Touch=0x41-0x57, Release=0x42-0x58（每电极 2 字节，交错）
-        // 所有 E0~E11 的阈值寄存器都可读可写，与 baseline 数据区域不同
-        printf("\r\nThreshold Registers (E0~E11, all readable):\r\n");
-        printf("| CH | Touch | Release |\r\n");
-        printf("|----|-------|---------|\r\n");
-        for (int ch = 0; ch < 12; ch++) {
-            uint8_t touch_th = 0, release_th = 0;
-            mpr_read_byte(addr, MPR121_TOUCHTH_L + ch * 2, &touch_th);
-            mpr_read_byte(addr, MPR121_RELEASETH_L + ch * 2, &release_th);
-            printf("| E%-2d| %-5d | %-7d |\r\n", ch, touch_th, release_th);
-        }
-    }
-
-    printf("\r\n");
-    printf("[MPR121 CONFIG] Note: Baseline data only readable for E0~E5\r\n");
-    printf("[MPR121 CONFIG]       (E6+ baseline addresses overlap with filter config)\r\n");
-    printf("[MPR121 CONFIG] Threshold registers are readable for all E0~E11\r\n");
-    printf("[MPR121 CONFIG] Debug monitoring range: E%d-E%d (filtered/baseline/delta)\r\n",
-           MPR121_DEBUG_FIRST_ELECTRODE, MPR121_DEBUG_LAST_ELECTRODE);
-    printf("[MPR121 CONFIG] Stat interval: %d ms, Sample divider: %d\r\n",
-           MPR121_DEBUG_STAT_INTERVAL_MS, MPR121_DEBUG_SAMPLE_DIVIDER);
-    printf("[MPR121 CONFIG] delta = filtered - baseline (negative = touched)\r\n");
-    printf("[MPR121 CONFIG] =================================================\r\n\r\n");
-
-    dbg_reset_stats();
-    dbg_stat_last_us = time_us_64();
-
-    // Initialize prev_touch to current state so we don't print spurious events
-    for (int i = 0; i < 3; i++) {
-        dbg_prev_touch[i] = touch_state[i];
-    }
-}
-
-void mpr121_debug_tick() {
-    // ---- 1. Sample divider: throttle I2C reads ----
-    dbg_loop_ctr++;
-    bool do_sample = (dbg_loop_ctr % MPR121_DEBUG_SAMPLE_DIVIDER) == 0;
-
-    // ---- 2. Event detection (uses touch_state, already read by mpr121_update) ----
-    for (int dev = 0; dev < 3; dev++) {
-        if (!mpr_ready[dev]) continue;
-        uint32_t changed = touch_state[dev] ^ dbg_prev_touch[dev];
-        if (!changed) continue;
-
-        for (int ch = MPR121_DEBUG_FIRST_ELECTRODE;
-             ch <= MPR121_DEBUG_LAST_ELECTRODE; ch++) {
-            if (!(changed & (1u << ch))) continue;
-
-            bool now_touched = (touch_state[dev] >> ch) & 1u;
-
-            // Read current filtered/baseline for this electrode
-            dbg_sample_channel(dev, ch);
-
-            struct mpr121_dbg_ch_t *c = &dbg_ch[dev][ch];
-            printf("[MPR121 EVENT] MPR%d-E%-2d %-7s filtered=%-5u baseline=%-5u delta=%+6d\r\n",
-                   dev + 1, ch,
-                   now_touched ? "TOUCH" : "RELEASE",
-                   c->filtered, c->baseline, c->delta);
-        }
-        dbg_prev_touch[dev] = touch_state[dev];
-    }
-
-    // ---- 3. Cycling read for stats accumulation ----
-    if (do_sample) {
-        // Skip devices not in range or not ready
-        int attempts = 0;
-        while (attempts < 36) {  // at most 36 channels to cycle through
-            if (mpr_ready[dbg_read_dev] &&
-                dbg_read_ch >= MPR121_DEBUG_FIRST_ELECTRODE &&
-                dbg_read_ch <= MPR121_DEBUG_LAST_ELECTRODE) {
-                dbg_sample_channel(dbg_read_dev, dbg_read_ch);
-                dbg_advance_pos();
-                break;
-            }
-            dbg_advance_pos();
-            attempts++;
-        }
-    }
-
-    // ---- 4. Periodic stats output ----
-    uint64_t now_us = time_us_64();
-    uint64_t elapsed_ms = (now_us - dbg_stat_last_us) / 1000u;
-    if (elapsed_ms < MPR121_DEBUG_STAT_INTERVAL_MS) return;
-
-    uint32_t t_ms = (uint32_t)(now_us / 1000u);
-
-    printf("\r\n[MPR121 STAT t=%lums]\r\n", (unsigned long)t_ms);
-
-    for (int dev = 0; dev < 3; dev++) {
-        if (!mpr_ready[dev]) continue;
-
-        int first = MPR121_DEBUG_FIRST_ELECTRODE;
-        int last  = MPR121_DEBUG_LAST_ELECTRODE;
-
-        printf("--- MPR%d [0x%02X] ---\r\n", dev + 1, mpr_addr[dev]);
-        dbg_print_table_header(dev);
-
-        // filtered row
-        printf("| filtered  |");
-        for (int ch = first; ch <= last; ch++) {
-            printf(" %-5u|", dbg_ch[dev][ch].filtered);
-        }
-        printf("\r\n");
-
-        // baseline row
-        printf("| baseline  |");
-        for (int ch = first; ch <= last; ch++) {
-            printf(" %-5u|", dbg_ch[dev][ch].baseline);
-        }
-        printf("\r\n");
-
-        // delta row
-        printf("| delta     |");
-        for (int ch = first; ch <= last; ch++) {
-            printf(" %+5d|", dbg_ch[dev][ch].delta);
-        }
-        printf("\r\n");
-
-        // filt_min row
-        printf("| filt_min  |");
-        for (int ch = first; ch <= last; ch++) {
-            struct mpr121_dbg_ch_t *c = &dbg_ch[dev][ch];
-            if (c->has_sample) printf(" %-5u|", c->filt_min);
-            else               printf("     -|");
-        }
-        printf("\r\n");
-
-        // filt_max row
-        printf("| filt_max  |");
-        for (int ch = first; ch <= last; ch++) {
-            struct mpr121_dbg_ch_t *c = &dbg_ch[dev][ch];
-            if (c->has_sample) printf(" %-5u|", c->filt_max);
-            else               printf("     -|");
-        }
-        printf("\r\n");
-
-        // delta_min row
-        printf("| delta_min |");
-        for (int ch = first; ch <= last; ch++) {
-            struct mpr121_dbg_ch_t *c = &dbg_ch[dev][ch];
-            if (c->has_sample) printf(" %+5d|", c->delta_min);
-            else               printf("     -|");
-        }
-        printf("\r\n");
-
-        // delta_max row
-        printf("| delta_max |");
-        for (int ch = first; ch <= last; ch++) {
-            struct mpr121_dbg_ch_t *c = &dbg_ch[dev][ch];
-            if (c->has_sample) printf(" %+5d|", c->delta_max);
-            else               printf("     -|");
-        }
-        printf("\r\n");
-
-        // touch_th row (read once from chip, doesn't change)
-        printf("| touch_th  |");
-        for (int ch = first; ch <= last; ch++) {
-            uint8_t thr = 0;
-            mpr_read_byte(mpr_addr[dev], MPR121_TOUCHTH_L + ch * 2, &thr);
-            printf(" %-5u|", thr);
-        }
-        printf("\r\n");
-
-        // release_th row
-        printf("| release_th|");
-        for (int ch = first; ch <= last; ch++) {
-            uint8_t thr = 0;
-            mpr_read_byte(mpr_addr[dev], MPR121_RELEASETH_L + ch * 2, &thr);
-            printf(" %-5u|", thr);
-        }
-        printf("\r\n");
-
-        // state row (from touch_state)
-        printf("| state     |");
-        for (int ch = first; ch <= last; ch++) {
-            printf(" %-5d|", (int)((touch_state[dev] >> ch) & 1u));
-        }
-        printf("\r\n");
-    }
-
-    printf("\r\n");
-
-    // Reset accumulators for next window
-    dbg_reset_stats();
-    dbg_stat_last_us = now_us;
-}
-
-#endif /* DEBUG_MPR121 */
-
 } // namespace Chuni245Tof

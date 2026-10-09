@@ -6,7 +6,7 @@
  *   - TimingBudget 真实生效: 统一常量 VL53L0X_TIMING_BUDGET_US = 20000us,
  *     通过 setMeasurementTimingBudget 写入 PRE/FINAL RANGE timeout 寄存器 (0x51/0x71),
  *     并在初始化末尾读回重算验证 (±200us 容差)
- *   - 所有 I2C 事务带超时 (i2c_*_blocking_until), 所有寄存器写检查返回值
+ *   - I2C、初始化与恢复均为协作式状态机，所有寄存器写检查返回值
  *   - 中断清除失败视为通信错误 (防止"旧数据标新")
  *
  * I2C1 总线由 Core1 独占 —— 本文件所有函数只能在 Core1 上调用。
@@ -18,6 +18,8 @@
 
 #include "pico/time.h"
 #include "hardware/i2c.h"
+#include "i2c_async.h"
+#include "cooperative_task.h"
 #include "hardware/gpio.h"
 
 #include <string.h>
@@ -114,102 +116,64 @@ static volatile uint32_t recovery_count[5] = { 0 };
 static uint16_t last_distance[5] = { 0 };
 
 //==============================================================================
-// 让出回调（单传感器恢复期间保持其他传感器数据新鲜）
+// 固定内存的协作式任务（每次 task_step 只推进一个叶任务）
 //==============================================================================
 
-// 由 tof_reader 注册; 在初始化/恢复的长等待期间被周期性调用,
-// 继续轮询健康的传感器, 使其数据年龄远小于 MAX_DATA_AGE_MS (50ms)。
-// 回调在 Core1 上执行, 只允许调用本驱动的读取接口。
-static void (*yield_callback)(void) = NULL;
+// 初始化/恢复与采样交错执行；等待 I2C 或时限时立即返回 Core1 调度器。
+static AsyncI2c tof_bus(I2C1_PORT);
+static bool io_claimed = false;
+static bool address_conflict = false; // Core1 only; cleared by full readdressing
 
-void vl53l0x_set_yield_callback(void (*cb)(void))
-{
-    yield_callback = cb;
+static Task<bool> delay_us(uint64_t duration) {
+    const uint64_t end = time_us_64() + duration;
+    while (time_us_64() < end) co_await std::suspend_always{};
+    co_return true;
 }
 
-static inline void yield_poll(void)
-{
-    if (yield_callback) yield_callback();
+static Task<bool> transfer(uint8_t addr, const uint8_t* tx, size_t txlen,
+                           uint8_t* rx, size_t rxlen) {
+    while (io_claimed || tof_bus.busy()) co_await std::suspend_always{};
+    io_claimed = true;
+    bool started = tof_bus.start(addr, tx, txlen, rxlen, I2C_TRANSACTION_TIMEOUT_US);
+    while (tof_bus.busy()) co_await std::suspend_always{};
+    bool ok = started && tof_bus.result() == (int)(txlen + rxlen);
+    if (ok && rxlen) memcpy(rx, tof_bus.data(), rxlen);
+    io_claimed = false;
+    co_return ok;
 }
-
-// 让出式延时: 等待期间持续让出给健康传感器轮询（~200us 粒度）
-static void yield_sleep_us(uint64_t us)
-{
-    uint64_t deadline = time_us_64() + us;
-    while (time_us_64() < deadline) {
-        yield_poll();
-        busy_wait_us(200);
-    }
+static Task<bool> write_reg(uint8_t addr, uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = {reg, val};
+    co_return co_await transfer(addr, buf, 2, nullptr, 0);
 }
-
-//==============================================================================
-// 底层 I2C（全部带超时, 全部检查返回值）
-//==============================================================================
-
-static bool write_reg(uint8_t addr, uint8_t reg, uint8_t val)
-{
-    uint8_t buf[2] = { reg, val };
-    int rc = i2c_write_blocking_until(I2C1_PORT, addr, buf, 2, false,
-                                      make_timeout_time_us(I2C_TRANSACTION_TIMEOUT_US));
-    return rc == 2;
+static Task<bool> read_reg(uint8_t addr, uint8_t reg, uint8_t* val) {
+    co_return co_await transfer(addr, &reg, 1, val, 1);
 }
-
-static bool read_reg(uint8_t addr, uint8_t reg, uint8_t *val)
-{
-    int rc = i2c_write_blocking_until(I2C1_PORT, addr, &reg, 1, true,
-                                      make_timeout_time_us(I2C_TRANSACTION_TIMEOUT_US));
-    if (rc != 1) return false;
-    rc = i2c_read_blocking_until(I2C1_PORT, addr, val, 1, false,
-                                 make_timeout_time_us(I2C_TRANSACTION_TIMEOUT_US));
-    return rc == 1;
-}
-
-static bool read_reg16(uint8_t addr, uint8_t reg, uint16_t *val)
-{
-    uint8_t buf[2] = { 0 };
-    int rc = i2c_write_blocking_until(I2C1_PORT, addr, &reg, 1, true,
-                                      make_timeout_time_us(I2C_TRANSACTION_TIMEOUT_US));
-    if (rc != 1) return false;
-    rc = i2c_read_blocking_until(I2C1_PORT, addr, buf, 2, false,
-                                 make_timeout_time_us(I2C_TRANSACTION_TIMEOUT_US));
-    if (rc != 2) return false;
+static Task<bool> read_reg16(uint8_t addr, uint8_t reg, uint16_t* val) {
+    uint8_t buf[2]{};
+    if (!(co_await transfer(addr, &reg, 1, buf, 2))) co_return false;
     *val = ((uint16_t)buf[0] << 8) | buf[1];
-    return true;
+    co_return true;
 }
-
-static bool write_reg16(uint8_t addr, uint8_t reg, uint16_t val)
-{
-    uint8_t buf[3] = { reg, (uint8_t)(val >> 8), (uint8_t)(val & 0xFF) };
-    int rc = i2c_write_blocking_until(I2C1_PORT, addr, buf, 3, false,
-                                      make_timeout_time_us(I2C_TRANSACTION_TIMEOUT_US));
-    return rc == 3;
+static Task<bool> write_reg16(uint8_t addr, uint8_t reg, uint16_t val) {
+    uint8_t buf[3] = {reg, (uint8_t)(val >> 8), (uint8_t)val};
+    co_return co_await transfer(addr, buf, 3, nullptr, 0);
 }
-
-static bool write_multi(uint8_t addr, uint8_t reg, const uint8_t *src, uint8_t len)
-{
+static Task<bool> write_multi(uint8_t addr, uint8_t reg, const uint8_t* src, uint8_t len) {
     uint8_t buf[8];
+    if (len > sizeof(buf) - 1) co_return false;
     buf[0] = reg;
-    memcpy(&buf[1], src, len);
-    int rc = i2c_write_blocking_until(I2C1_PORT, addr, buf, len + 1, false,
-                                      make_timeout_time_us(I2C_TRANSACTION_TIMEOUT_US));
-    return rc == (int)(len + 1);
+    memcpy(buf + 1, src, len);
+    co_return co_await transfer(addr, buf, len + 1, nullptr, 0);
 }
-
-static bool read_multi(uint8_t addr, uint8_t reg, uint8_t *dst, uint8_t len)
-{
-    int rc = i2c_write_blocking_until(I2C1_PORT, addr, &reg, 1, true,
-                                      make_timeout_time_us(I2C_TRANSACTION_TIMEOUT_US));
-    if (rc != 1) return false;
-    rc = i2c_read_blocking_until(I2C1_PORT, addr, dst, len, false,
-                                 make_timeout_time_us(I2C_TRANSACTION_TIMEOUT_US));
-    return rc == (int)len;
+static Task<bool> read_multi(uint8_t addr, uint8_t reg, uint8_t* dst, uint8_t len) {
+    co_return co_await transfer(addr, &reg, 1, dst, len);
 }
 
 // 记录通信错误
 static void record_comm_error(uint8_t index)
 {
-    i2c_error_count[index]++;
-    consecutive_errors[index]++;
+    i2c_error_count[index] = i2c_error_count[index] + 1;
+    consecutive_errors[index] = consecutive_errors[index] + 1;
 }
 
 // 记录一次成功的通信（任何寄存器读成功都证明 总线+传感器 仍可访问）
@@ -220,11 +184,11 @@ static inline void stamp_comm_ok(uint8_t index)
 }
 
 // 检查传感器在指定地址响应且型号正确 (MODEL_ID = 0xEE)
-static bool check_model_id(uint8_t addr)
+static Task<bool> check_model_id(uint8_t addr)
 {
     uint8_t model = 0;
-    if (!read_reg(addr, REG_IDENTIFICATION_MODEL_ID, &model)) return false;
-    return model == 0xEE;
+    if (!(co_await read_reg(addr, REG_IDENTIFICATION_MODEL_ID, &model))) co_return false;
+    co_return model == 0xEE;
 }
 
 //==============================================================================
@@ -247,7 +211,9 @@ static inline uint32_t calc_macro_period_ns(uint16_t vcsel_period_pclks)
 // decodeTimeout: 16bit timeout 寄存器值 → MCLK 数
 static inline uint32_t decode_timeout(uint16_t reg_val)
 {
-    return (((uint32_t)reg_val & 0xFF) << ((reg_val >> 8) & 0xFF)) + 1;
+    const uint32_t exponent = reg_val >> 8;
+    if (exponent >= 24) return 0;
+    return (((uint32_t)reg_val & 0xFF) << exponent) + 1;
 }
 
 // encodeTimeout: MCLK 数 → 16bit timeout 寄存器值
@@ -299,20 +265,20 @@ struct seq_step_timeouts_t {
     uint32_t final_range_us;
 };
 
-static bool get_sequence_step_enables(uint8_t addr, seq_step_enables_t *enables)
+static Task<bool> get_sequence_step_enables(uint8_t addr, seq_step_enables_t *enables)
 {
     uint8_t seq_config;
-    if (!read_reg(addr, REG_SYSTEM_SEQUENCE_CONFIG, &seq_config)) return false;
+    if (!(co_await read_reg(addr, REG_SYSTEM_SEQUENCE_CONFIG, &seq_config))) co_return false;
 
     enables->tcc         = (seq_config >> 4) & 0x1;
     enables->msrc        = (seq_config >> 2) & 0x1;
     enables->dss         = (seq_config >> 3) & 0x1;
     enables->pre_range   = (seq_config >> 6) & 0x1;
     enables->final_range = (seq_config >> 7) & 0x1;
-    return true;
+    co_return true;
 }
 
-static bool get_sequence_step_timeouts(uint8_t addr,
+static Task<bool> get_sequence_step_timeouts(uint8_t addr,
                                        const seq_step_enables_t *enables,
                                        seq_step_timeouts_t *timeouts)
 {
@@ -320,28 +286,28 @@ static bool get_sequence_step_timeouts(uint8_t addr,
     uint8_t reg8;
 
     // pre_range VCSEL 周期 (寄存器 0x50)
-    if (!read_reg(addr, REG_PRE_RANGE_CONFIG_VCSEL_PERIOD, &reg8)) return false;
+    if (!(co_await read_reg(addr, REG_PRE_RANGE_CONFIG_VCSEL_PERIOD, &reg8))) co_return false;
     timeouts->pre_range_vcsel_period_pclks = decode_vcsel_period(reg8);
 
     // MSRC/DSS/TCC timeout (8bit 寄存器 0x46: 值+1 = MCLK 数)
-    if (!read_reg(addr, REG_MSRC_CONFIG_TIMEOUT_MACROP, &reg8)) return false;
+    if (!(co_await read_reg(addr, REG_MSRC_CONFIG_TIMEOUT_MACROP, &reg8))) co_return false;
     timeouts->msrc_dss_tcc_mclks = (uint16_t)reg8 + 1;
     timeouts->msrc_dss_tcc_us = timeout_mclks_to_us(timeouts->msrc_dss_tcc_mclks,
                                                     timeouts->pre_range_vcsel_period_pclks);
 
     // pre_range timeout (16bit 寄存器 0x51)
-    if (!read_reg16(addr, REG_PRE_RANGE_CONFIG_TIMEOUT_MACROP, &reg16)) return false;
+    if (!(co_await read_reg16(addr, REG_PRE_RANGE_CONFIG_TIMEOUT_MACROP, &reg16))) co_return false;
     timeouts->pre_range_mclks = decode_timeout(reg16);
     timeouts->pre_range_us = timeout_mclks_to_us(timeouts->pre_range_mclks,
                                                  timeouts->pre_range_vcsel_period_pclks);
 
     // final_range VCSEL 周期 (寄存器 0x70)
-    if (!read_reg(addr, REG_FINAL_RANGE_CONFIG_VCSEL_PERIOD, &reg8)) return false;
+    if (!(co_await read_reg(addr, REG_FINAL_RANGE_CONFIG_VCSEL_PERIOD, &reg8))) co_return false;
     timeouts->final_range_vcsel_period_pclks = decode_vcsel_period(reg8);
 
     // final_range timeout (16bit 寄存器 0x71):
     // 寄存器统计的是 pre+final 的总 MCLK 数, 读回时必须扣除 pre 部分
-    if (!read_reg16(addr, REG_FINAL_RANGE_CONFIG_TIMEOUT_MACROP, &reg16)) return false;
+    if (!(co_await read_reg16(addr, REG_FINAL_RANGE_CONFIG_TIMEOUT_MACROP, &reg16))) co_return false;
     timeouts->final_range_mclks = decode_timeout(reg16);
     if (enables->pre_range) {
         timeouts->final_range_mclks -= timeouts->pre_range_mclks;
@@ -349,7 +315,7 @@ static bool get_sequence_step_timeouts(uint8_t addr,
     timeouts->final_range_us = timeout_mclks_to_us(timeouts->final_range_mclks,
                                                    timeouts->final_range_vcsel_period_pclks);
 
-    return true;
+    co_return true;
 }
 
 //==============================================================================
@@ -366,16 +332,16 @@ constexpr uint32_t OVERHEAD_DSS_OVERRHEAD_US        = 690;
 constexpr uint32_t OVERHEAD_PRE_RANGE_OVERRHEAD_US  = 660;
 constexpr uint32_t OVERHEAD_FINAL_RANGE_OVERRHEAD_US = 550;
 
-static bool set_measurement_timing_budget(uint8_t addr, uint32_t budget_us)
+static Task<bool> set_measurement_timing_budget(uint8_t addr, uint32_t budget_us)
 {
     seq_step_enables_t enables;
     seq_step_timeouts_t timeouts;
 
-    if (!get_sequence_step_enables(addr, &enables)) return false;
-    if (!get_sequence_step_timeouts(addr, &enables, &timeouts)) return false;
+    if (!(co_await get_sequence_step_enables(addr, &enables))) co_return false;
+    if (!(co_await get_sequence_step_timeouts(addr, &enables, &timeouts))) co_return false;
 
     const uint32_t min_budget = OVERHEAD_START_OVERRHEAD_US + OVERHEAD_END_OVERRHEAD_US;
-    if (budget_us < min_budget) return false;
+    if (budget_us < min_budget) co_return false;
 
     uint32_t used_budget_us = min_budget;
 
@@ -393,7 +359,7 @@ static bool set_measurement_timing_budget(uint8_t addr, uint32_t budget_us)
     if (enables.final_range) {
         used_budget_us += OVERHEAD_FINAL_RANGE_OVERRHEAD_US;
 
-        if (used_budget_us > budget_us) return false;
+        if (used_budget_us > budget_us) co_return false;
 
         uint32_t final_range_timeout_us = budget_us - used_budget_us;
 
@@ -407,26 +373,26 @@ static bool set_measurement_timing_budget(uint8_t addr, uint32_t budget_us)
             final_range_timeout_mclks += timeouts.pre_range_mclks;
         }
 
-        if (!write_reg16(addr, REG_FINAL_RANGE_CONFIG_TIMEOUT_MACROP,
-                         encode_timeout(final_range_timeout_mclks))) {
-            return false;
+        if (!(co_await write_reg16(addr, REG_FINAL_RANGE_CONFIG_TIMEOUT_MACROP,
+                         encode_timeout(final_range_timeout_mclks)))) {
+            co_return false;
         }
     }
 
-    return true;
+    co_return true;
 }
 
 //==============================================================================
 // TimingBudget 读回验证: 从寄存器重算实际 budget, 与目标值比对
 //==============================================================================
 
-static bool get_measurement_timing_budget(uint8_t addr, uint32_t *budget_us)
+static Task<bool> get_measurement_timing_budget(uint8_t addr, uint32_t *budget_us)
 {
     seq_step_enables_t enables;
     seq_step_timeouts_t timeouts;
 
-    if (!get_sequence_step_enables(addr, &enables)) return false;
-    if (!get_sequence_step_timeouts(addr, &enables, &timeouts)) return false;
+    if (!(co_await get_sequence_step_enables(addr, &enables))) co_return false;
+    if (!(co_await get_sequence_step_timeouts(addr, &enables, &timeouts))) co_return false;
 
     uint32_t used_budget_us = OVERHEAD_START_OVERRHEAD_US + OVERHEAD_END_OVERRHEAD_US;
 
@@ -447,82 +413,82 @@ static bool get_measurement_timing_budget(uint8_t addr, uint32_t *budget_us)
     }
 
     *budget_us = used_budget_us;
-    return true;
+    co_return true;
 }
 
 //==============================================================================
 // SPAD 管理（移植自 Pololu getSpadInfo / init SPAD 部分）
 //==============================================================================
 
-static bool get_spad_info(uint8_t addr, uint8_t *count, bool *type_is_aperture)
+static Task<bool> get_spad_info(uint8_t addr, uint8_t *count, bool *type_is_aperture)
 {
     uint8_t tmp;
 
-    if (!write_reg(addr, 0x80, 0x01)) return false;
-    if (!write_reg(addr, 0xFF, 0x01)) return false;
-    if (!write_reg(addr, 0x00, 0x00)) return false;
+    if (!(co_await write_reg(addr, 0x80, 0x01))) co_return false;
+    if (!(co_await write_reg(addr, 0xFF, 0x01))) co_return false;
+    if (!(co_await write_reg(addr, 0x00, 0x00))) co_return false;
 
-    if (!write_reg(addr, 0xFF, 0x06)) return false;
+    if (!(co_await write_reg(addr, 0xFF, 0x06))) co_return false;
     uint8_t r83;
-    if (!read_reg(addr, 0x83, &r83)) return false;
-    if (!write_reg(addr, 0x83, r83 | 0x04)) return false;
+    if (!(co_await read_reg(addr, 0x83, &r83))) co_return false;
+    if (!(co_await write_reg(addr, 0x83, r83 | 0x04))) co_return false;
 
-    if (!write_reg(addr, 0xFF, 0x07)) return false;
-    if (!write_reg(addr, 0x81, 0x01)) return false;
-    if (!write_reg(addr, 0x80, 0x01)) return false;
-    if (!write_reg(addr, 0x94, 0x6b)) return false;
-    if (!write_reg(addr, 0x83, 0x00)) return false;
+    if (!(co_await write_reg(addr, 0xFF, 0x07))) co_return false;
+    if (!(co_await write_reg(addr, 0x81, 0x01))) co_return false;
+    if (!(co_await write_reg(addr, 0x80, 0x01))) co_return false;
+    if (!(co_await write_reg(addr, 0x94, 0x6b))) co_return false;
+    if (!(co_await write_reg(addr, 0x83, 0x00))) co_return false;
 
     // 等待 SPAD map 准备好（带超时, 每 200us 轮询一次, 期间让出给健康传感器）
     uint64_t deadline = time_us_64() + 50000;   // 50ms 超时
     do {
-        sleep_us(200);
-        yield_poll();
-        if (!read_reg(addr, 0x83, &tmp)) return false;
-        if (time_us_64() > deadline) return false;
+        (co_await delay_us(200));
+
+        if (!(co_await read_reg(addr, 0x83, &tmp))) co_return false;
+        if (time_us_64() > deadline) co_return false;
     } while (tmp == 0x00);
 
-    if (!write_reg(addr, 0x83, 0x01)) return false;
-    if (!read_reg(addr, 0x92, &tmp)) return false;
+    if (!(co_await write_reg(addr, 0x83, 0x01))) co_return false;
+    if (!(co_await read_reg(addr, 0x92, &tmp))) co_return false;
 
     *count = tmp & 0x7f;
     *type_is_aperture = (tmp >> 7) & 0x01;
 
-    if (!write_reg(addr, 0x81, 0x00)) return false;
-    if (!write_reg(addr, 0xFF, 0x06)) return false;
-    if (!read_reg(addr, 0x83, &r83)) return false;
-    if (!write_reg(addr, 0x83, r83 & ~0x04)) return false;
+    if (!(co_await write_reg(addr, 0x81, 0x00))) co_return false;
+    if (!(co_await write_reg(addr, 0xFF, 0x06))) co_return false;
+    if (!(co_await read_reg(addr, 0x83, &r83))) co_return false;
+    if (!(co_await write_reg(addr, 0x83, r83 & ~0x04))) co_return false;
 
-    if (!write_reg(addr, 0xFF, 0x01)) return false;
-    if (!write_reg(addr, 0x00, 0x01)) return false;
-    if (!write_reg(addr, 0xFF, 0x00)) return false;
-    if (!write_reg(addr, 0x80, 0x00)) return false;
+    if (!(co_await write_reg(addr, 0xFF, 0x01))) co_return false;
+    if (!(co_await write_reg(addr, 0x00, 0x01))) co_return false;
+    if (!(co_await write_reg(addr, 0xFF, 0x00))) co_return false;
+    if (!(co_await write_reg(addr, 0x80, 0x00))) co_return false;
 
-    return true;
+    co_return true;
 }
 
 //==============================================================================
 // 参考校准（移植自 Pololu performSingleRefCalibration）
 //==============================================================================
 
-static bool perform_single_ref_calibration(uint8_t addr, uint8_t vhv_init_byte)
+static Task<bool> perform_single_ref_calibration(uint8_t addr, uint8_t vhv_init_byte)
 {
-    if (!write_reg(addr, REG_SYSRANGE_START, 0x01 | vhv_init_byte)) return false;
+    if (!(co_await write_reg(addr, REG_SYSRANGE_START, 0x01 | vhv_init_byte))) co_return false;
 
     // 等待中断状态位变化（带超时, 期间让出给健康传感器）
     uint64_t deadline = time_us_64() + 200000;   // 200ms 超时
     uint8_t status;
     do {
-        sleep_us(200);
-        yield_poll();
-        if (!read_reg(addr, REG_RESULT_INTERRUPT_STATUS, &status)) return false;
-        if (time_us_64() > deadline) return false;
+        (co_await delay_us(200));
+
+        if (!(co_await read_reg(addr, REG_RESULT_INTERRUPT_STATUS, &status))) co_return false;
+        if (time_us_64() > deadline) co_return false;
     } while ((status & 0x07) == 0);
 
-    if (!write_reg(addr, REG_SYSTEM_INTERRUPT_CLEAR, 0x01)) return false;
-    if (!write_reg(addr, REG_SYSRANGE_START, 0x00)) return false;
+    if (!(co_await write_reg(addr, REG_SYSTEM_INTERRUPT_CLEAR, 0x01))) co_return false;
+    if (!(co_await write_reg(addr, REG_SYSRANGE_START, 0x00))) co_return false;
 
-    return true;
+    co_return true;
 }
 
 //==============================================================================
@@ -551,33 +517,33 @@ static const uint16_t tuning_settings[] = {
 
 constexpr size_t TUNING_SETTINGS_COUNT = sizeof(tuning_settings) / sizeof(tuning_settings[0]);
 
-static bool apply_tuning_settings(uint8_t addr)
+static Task<bool> apply_tuning_settings(uint8_t addr)
 {
     for (size_t i = 0; i < TUNING_SETTINGS_COUNT; i++) {
         uint8_t reg = (uint8_t)(tuning_settings[i] >> 8);
         uint8_t val = (uint8_t)(tuning_settings[i] & 0xFF);
-        if (!write_reg(addr, reg, val)) return false;
+        if (!(co_await write_reg(addr, reg, val))) co_return false;
     }
-    return true;
+    co_return true;
 }
 
 //==============================================================================
 // 连续测距启动（移植自 Pololu startContinuous, back-to-back 模式）
 //==============================================================================
 
-static bool start_continuous_backto_back(uint8_t addr, uint8_t stop_var)
+static Task<bool> start_continuous_backto_back(uint8_t addr, uint8_t stop_var)
 {
     // back-to-back 模式前导码（DSS 必需的 stop variable 写回）
-    if (!write_reg(addr, 0x80, 0x01)) return false;
-    if (!write_reg(addr, 0xFF, 0x01)) return false;
-    if (!write_reg(addr, 0x00, 0x00)) return false;
-    if (!write_reg(addr, 0x91, stop_var)) return false;
-    if (!write_reg(addr, 0x00, 0x01)) return false;
-    if (!write_reg(addr, 0xFF, 0x00)) return false;
-    if (!write_reg(addr, 0x80, 0x00)) return false;
+    if (!(co_await write_reg(addr, 0x80, 0x01))) co_return false;
+    if (!(co_await write_reg(addr, 0xFF, 0x01))) co_return false;
+    if (!(co_await write_reg(addr, 0x00, 0x00))) co_return false;
+    if (!(co_await write_reg(addr, 0x91, stop_var))) co_return false;
+    if (!(co_await write_reg(addr, 0x00, 0x01))) co_return false;
+    if (!(co_await write_reg(addr, 0xFF, 0x00))) co_return false;
+    if (!(co_await write_reg(addr, 0x80, 0x00))) co_return false;
 
     // SYSRANGE_START = 0x02 → MODE_BACKTOBACK 连续测距
-    return write_reg(addr, REG_SYSRANGE_START, 0x02);
+    co_return (co_await write_reg(addr, REG_SYSRANGE_START, 0x02));
 }
 
 //==============================================================================
@@ -585,7 +551,7 @@ static bool start_continuous_backto_back(uint8_t addr, uint8_t stop_var)
 // 前置条件: 传感器刚经历 XSHUT 复位（地址回到 0x29）
 //==============================================================================
 
-static bool init_sensor(uint8_t index)
+static Task<bool> init_sensor(uint8_t index)
 {
     const uint8_t new_addr = sensor_addr[index];
     uint16_t reg16;
@@ -593,61 +559,61 @@ static bool init_sensor(uint8_t index)
 
     // ---- XSHUT 释放 + 等待启动（让出式等待, 不阻塞健康传感器轮询）----
     gpio_put(xshut_pins[index], 1);
-    yield_sleep_us((uint64_t)SENSOR_BOOT_DELAY_MS * 1000u);
+    (co_await delay_us((uint64_t)SENSOR_BOOT_DELAY_MS * 1000u));
 
     // ---- 1. 在默认地址检查存在性 ----
-    if (!check_model_id(VL53L0X_DEFAULT_ADDR)) {
-        return false;
+    if (!(co_await check_model_id(VL53L0X_DEFAULT_ADDR))) {
+        co_return false;
     }
 
     // ---- 2. 修改 I2C 地址并验证 ----
-    if (!write_reg(VL53L0X_DEFAULT_ADDR, REG_I2C_SLAVE_DEVICE_ADDRESS, new_addr)) {
-        return false;
+    if (!(co_await write_reg(VL53L0X_DEFAULT_ADDR, REG_I2C_SLAVE_DEVICE_ADDRESS, new_addr))) {
+        co_return false;
     }
-    yield_sleep_us(2000);   // 地址切换稳定等待
-    if (!check_model_id(new_addr)) {
-        return false;
+    (co_await delay_us(2000));   // 地址切换稳定等待
+    if (!(co_await check_model_id(new_addr))) {
+        co_return false;
     }
 
     // ---- 3. 2V8 IO 模式（模块为 3.3V 供电）----
-    if (!read_reg(new_addr, REG_VHV_CONFIG_PAD_SCL_SDA_EXTSUP_HV, &reg8)) return false;
-    if (!write_reg(new_addr, REG_VHV_CONFIG_PAD_SCL_SDA_EXTSUP_HV, reg8 | 0x01)) return false;
+    if (!(co_await read_reg(new_addr, REG_VHV_CONFIG_PAD_SCL_SDA_EXTSUP_HV, &reg8))) co_return false;
+    if (!(co_await write_reg(new_addr, REG_VHV_CONFIG_PAD_SCL_SDA_EXTSUP_HV, reg8 | 0x01))) co_return false;
 
     // ---- 4. Set I2C standard mode (官方 init 序列) ----
-    if (!write_reg(new_addr, 0x88, 0x00)) return false;
+    if (!(co_await write_reg(new_addr, 0x88, 0x00))) co_return false;
 
     // ---- 5. 读取 stop variable (DSS 模式启动测距需要) ----
-    if (!write_reg(new_addr, 0x80, 0x01)) return false;
-    if (!write_reg(new_addr, 0xFF, 0x01)) return false;
-    if (!write_reg(new_addr, 0x00, 0x00)) return false;
-    if (!read_reg(new_addr, 0x91, &stop_variable[index])) return false;
-    if (!write_reg(new_addr, 0x00, 0x01)) return false;
-    if (!write_reg(new_addr, 0xFF, 0x00)) return false;
-    if (!write_reg(new_addr, 0x80, 0x00)) return false;
+    if (!(co_await write_reg(new_addr, 0x80, 0x01))) co_return false;
+    if (!(co_await write_reg(new_addr, 0xFF, 0x01))) co_return false;
+    if (!(co_await write_reg(new_addr, 0x00, 0x00))) co_return false;
+    if (!(co_await read_reg(new_addr, 0x91, &stop_variable[index]))) co_return false;
+    if (!(co_await write_reg(new_addr, 0x00, 0x01))) co_return false;
+    if (!(co_await write_reg(new_addr, 0xFF, 0x00))) co_return false;
+    if (!(co_await write_reg(new_addr, 0x80, 0x00))) co_return false;
 
     // ---- 6. 禁用 MSRC 默认阈值控制, 启用 signal rate limit ----
-    if (!read_reg(new_addr, REG_MSRC_CONFIG_CONTROL, &reg8)) return false;
-    if (!write_reg(new_addr, REG_MSRC_CONFIG_CONTROL, reg8 | 0x12)) return false;
+    if (!(co_await read_reg(new_addr, REG_MSRC_CONFIG_CONTROL, &reg8))) co_return false;
+    if (!(co_await write_reg(new_addr, REG_MSRC_CONFIG_CONTROL, reg8 | 0x12))) co_return false;
 
-    if (!write_reg16(new_addr, REG_FINAL_RANGE_CONFIG_MIN_COUNT_RATE_RTN_LIMIT,
-                     VL53L0X_SIGNAL_RATE_LIMIT_Q97)) return false;
+    if (!(co_await write_reg16(new_addr, REG_FINAL_RANGE_CONFIG_MIN_COUNT_RATE_RTN_LIMIT,
+                     VL53L0X_SIGNAL_RATE_LIMIT_Q97))) co_return false;
 
     // ---- 7. SPAD 管理 ----
-    if (!write_reg(new_addr, REG_SYSTEM_SEQUENCE_CONFIG, 0xFF)) return false;
+    if (!(co_await write_reg(new_addr, REG_SYSTEM_SEQUENCE_CONFIG, 0xFF))) co_return false;
 
     uint8_t spad_count;
     bool spad_type_is_aperture;
-    if (!get_spad_info(new_addr, &spad_count, &spad_type_is_aperture)) return false;
+    if (!(co_await get_spad_info(new_addr, &spad_count, &spad_type_is_aperture))) co_return false;
 
     uint8_t ref_spad_map[6];
-    if (!read_multi(new_addr, REG_GLOBAL_CONFIG_SPAD_ENABLES_REF_0, ref_spad_map, 6)) return false;
+    if (!(co_await read_multi(new_addr, REG_GLOBAL_CONFIG_SPAD_ENABLES_REF_0, ref_spad_map, 6))) co_return false;
 
     // Pololu: 根据 spad info 重写参考 SPAD 使能表
-    if (!write_reg(new_addr, 0xFF, 0x01)) return false;
-    if (!write_reg(new_addr, REG_DYNAMIC_SPAD_REF_EN_START_OFFSET, 0x00)) return false;
-    if (!write_reg(new_addr, REG_DYNAMIC_SPAD_NUM_REQUESTED_REF_SPAD, 0x2C)) return false;
-    if (!write_reg(new_addr, 0xFF, 0x00)) return false;
-    if (!write_reg(new_addr, REG_GLOBAL_CONFIG_REF_EN_START_SELECT, 0xB4)) return false;
+    if (!(co_await write_reg(new_addr, 0xFF, 0x01))) co_return false;
+    if (!(co_await write_reg(new_addr, REG_DYNAMIC_SPAD_REF_EN_START_OFFSET, 0x00))) co_return false;
+    if (!(co_await write_reg(new_addr, REG_DYNAMIC_SPAD_NUM_REQUESTED_REF_SPAD, 0x2C))) co_return false;
+    if (!(co_await write_reg(new_addr, 0xFF, 0x00))) co_return false;
+    if (!(co_await write_reg(new_addr, REG_GLOBAL_CONFIG_REF_EN_START_SELECT, 0xB4))) co_return false;
 
     uint8_t first_spad_to_enable = spad_type_is_aperture ? 12 : 0;
     uint8_t spads_enabled = 0;
@@ -660,68 +626,68 @@ static bool init_sensor(uint8_t index)
         }
     }
 
-    if (!write_multi(new_addr, REG_GLOBAL_CONFIG_SPAD_ENABLES_REF_0, ref_spad_map, 6)) return false;
+    if (!(co_await write_multi(new_addr, REG_GLOBAL_CONFIG_SPAD_ENABLES_REF_0, ref_spad_map, 6))) co_return false;
 
     // ---- 8. Tuning settings (官方校准数据) ----
-    if (!apply_tuning_settings(new_addr)) return false;
+    if (!(co_await apply_tuning_settings(new_addr))) co_return false;
 
     // ---- 9. 中断配置: 样本就绪中断, GPIO 低有效, 清除中断 ----
-    if (!write_reg(new_addr, REG_SYSTEM_INTERRUPT_CONFIG_GPIO, 0x04)) return false;
-    if (!read_reg(new_addr, REG_GPIO_HV_MUX_ACTIVE_HIGH, &reg8)) return false;
-    if (!write_reg(new_addr, REG_GPIO_HV_MUX_ACTIVE_HIGH, reg8 & ~0x10)) return false;
-    if (!write_reg(new_addr, REG_SYSTEM_INTERRUPT_CLEAR, 0x01)) return false;
+    if (!(co_await write_reg(new_addr, REG_SYSTEM_INTERRUPT_CONFIG_GPIO, 0x04))) co_return false;
+    if (!(co_await read_reg(new_addr, REG_GPIO_HV_MUX_ACTIVE_HIGH, &reg8))) co_return false;
+    if (!(co_await write_reg(new_addr, REG_GPIO_HV_MUX_ACTIVE_HIGH, reg8 & ~0x10))) co_return false;
+    if (!(co_await write_reg(new_addr, REG_SYSTEM_INTERRUPT_CLEAR, 0x01))) co_return false;
 
     // ---- 10. 序列配置: pre_range + final_range + dss (0xE8) ----
-    if (!write_reg(new_addr, REG_SYSTEM_SEQUENCE_CONFIG, 0xE8)) return false;
+    if (!(co_await write_reg(new_addr, REG_SYSTEM_SEQUENCE_CONFIG, 0xE8))) co_return false;
 
     // ---- 11. TimingBudget = 20ms (唯一配置点) ----
-    if (!set_measurement_timing_budget(new_addr, VL53L0X_TIMING_BUDGET_US)) return false;
+    if (!(co_await set_measurement_timing_budget(new_addr, VL53L0X_TIMING_BUDGET_US))) co_return false;
 
     // ---- 12. 读回验证: 从寄存器重算实际 budget ----
     uint32_t actual_budget = 0;
-    if (!get_measurement_timing_budget(new_addr, &actual_budget)) return false;
+    if (!(co_await get_measurement_timing_budget(new_addr, &actual_budget))) co_return false;
     int32_t diff = (int32_t)actual_budget - (int32_t)VL53L0X_TIMING_BUDGET_US;
     if (diff < -TIMING_BUDGET_VERIFY_TOLERANCE_US || diff > TIMING_BUDGET_VERIFY_TOLERANCE_US) {
         // 事件进队列（Core0 负责 CDC 输出）—— Core1 禁止 printf
         tof_event_post(TOF_EVT_BUDGET_VERIFY_FAIL, index, actual_budget);
-        return false;
+        co_return false;
     }
 
     uint16_t final_timeout_reg = 0;
     uint16_t pre_timeout_reg = 0;
-    read_reg16(new_addr, REG_FINAL_RANGE_CONFIG_TIMEOUT_MACROP, &final_timeout_reg);
-    read_reg16(new_addr, REG_PRE_RANGE_CONFIG_TIMEOUT_MACROP, &pre_timeout_reg);
+    (co_await read_reg16(new_addr, REG_FINAL_RANGE_CONFIG_TIMEOUT_MACROP, &final_timeout_reg));
+    (co_await read_reg16(new_addr, REG_PRE_RANGE_CONFIG_TIMEOUT_MACROP, &pre_timeout_reg));
 
     // ---- 13. 参考校准: VHV + phase ----
-    if (!write_reg(new_addr, REG_SYSTEM_SEQUENCE_CONFIG, 0x01)) return false;
-    if (!perform_single_ref_calibration(new_addr, 0x40)) return false;
+    if (!(co_await write_reg(new_addr, REG_SYSTEM_SEQUENCE_CONFIG, 0x01))) co_return false;
+    if (!(co_await perform_single_ref_calibration(new_addr, 0x40))) co_return false;
 
-    if (!write_reg(new_addr, REG_SYSTEM_SEQUENCE_CONFIG, 0x02)) return false;
-    if (!perform_single_ref_calibration(new_addr, 0x00)) return false;
+    if (!(co_await write_reg(new_addr, REG_SYSTEM_SEQUENCE_CONFIG, 0x02))) co_return false;
+    if (!(co_await perform_single_ref_calibration(new_addr, 0x00))) co_return false;
 
-    if (!write_reg(new_addr, REG_SYSTEM_SEQUENCE_CONFIG, 0xE8)) return false;
+    if (!(co_await write_reg(new_addr, REG_SYSTEM_SEQUENCE_CONFIG, 0xE8))) co_return false;
 
     // ---- 14. 启动连续测距 (back-to-back) ----
-    if (!start_continuous_backto_back(new_addr, stop_variable[index])) return false;
+    if (!(co_await start_continuous_backto_back(new_addr, stop_variable[index]))) co_return false;
 
     // ---- 15. 最终状态确认 ----
     uint16_t range_status = 0;
-    if (!read_reg16(new_addr, REG_RESULT_RANGE_STATUS, &range_status)) return false;
+    if (!(co_await read_reg16(new_addr, REG_RESULT_RANGE_STATUS, &range_status))) co_return false;
 
     // 就绪事件进队列（Core0 负责 CDC 输出）—— Core1 禁止 printf
     tof_event_post(TOF_EVT_READY, index, actual_budget);
 
-    return true;
+    co_return true;
 }
 
 //==============================================================================
 // 公共 API —— 初始化与恢复
 //==============================================================================
 
-void vl53l0x_init(void)
+static Task<bool> init_all(void)
 {
     // ---- I2C1 外设初始化 ----
-    i2c_init(I2C1_PORT, I2C1_FREQ_HZ);
+    tof_bus.init(I2C1_FREQ_HZ);
     gpio_set_function(I2C1_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C1_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C1_SDA);
@@ -734,7 +700,7 @@ void vl53l0x_init(void)
         gpio_put(xshut_pins[i], 0);
     }
 
-    sleep_ms(XSHUT_RESET_DELAY_MS);
+    (co_await delay_us((uint64_t)(XSHUT_RESET_DELAY_MS) * 1000u));
 
     // ---- 逐颗释放并初始化（避免地址冲突: 同一时刻只有一颗处于 0x29）----
     for (int i = 0; i < 5; i++) {
@@ -744,7 +710,7 @@ void vl53l0x_init(void)
         health_override[i] = HO_NONE;
         last_distance[i] = 0;
 
-        if (init_sensor(i)) {
+        if ((co_await init_sensor(i))) {
             sensor_ready[i] = true;
             // 数据/通信时间基准从初始化成功时刻开始计时
             // (防止 5 颗总初始化时间超过 no-data 阈值时误触发恢复)
@@ -759,14 +725,17 @@ void vl53l0x_init(void)
             tof_event_post(TOF_EVT_INIT_FAIL, i, 0);
         }
     }
+
+    co_return true;
 }
 
 // 单传感器恢复: XSHUT 硬复位 + 完整重初始化（与冷启动完全同一路径）
-bool vl53l0x_recover_sensor(uint8_t index)
+#if CHUNI_TOF_RECOVERY_ENABLE
+Task<bool> recover_sensor_job(uint8_t index)
 {
-    if (index >= 5) return false;
+    if (index >= 5) co_return false;
 
-    recovery_count[index]++;
+    recovery_count[index] = recovery_count[index] + 1;
 
     // 复位期间标记离线, 快照数据由调用者失效
     sensor_ready[index] = false;
@@ -774,33 +743,46 @@ bool vl53l0x_recover_sensor(uint8_t index)
 
     // XSHUT 拉低硬复位 → 地址回到 0x29（让出式等待）
     gpio_put(xshut_pins[index], 0);
-    yield_sleep_us((uint64_t)XSHUT_RESET_DELAY_MS * 1000u);
+    (co_await delay_us((uint64_t)XSHUT_RESET_DELAY_MS * 1000u));
 
-    if (init_sensor(index)) {
+    // The target is held in reset. Any ACK at 0x29 belongs to ANOTHER sensor
+    // that has lost its assigned address (e.g. a shared power/reset transient).
+    // Do not broadcast an address write to two sensors. Let the scheduler
+    // hold all XSHUT low and readdress them one at a time.
+    uint8_t unexpected_model = 0;
+    if (co_await read_reg(VL53L0X_DEFAULT_ADDR, REG_IDENTIFICATION_MODEL_ID, &unexpected_model)) {
+        address_conflict = true;
+        health_override[index] = HO_OFFLINE;
+        co_return false;
+    }
+
+    if ((co_await init_sensor(index))) {
         sensor_ready[index] = true;
         health_override[index] = HO_NONE;
         consecutive_errors[index] = 0;
         uint32_t now = to_ms_since_boot(get_absolute_time());
         last_new_data_ms[index] = now;
         last_comm_ok_ms[index] = now;
-        return true;
+        co_return true;
     }
 
     // 恢复失败: 保持复位, 等待下次退避重试
     gpio_put(xshut_pins[index], 0);
     sensor_ready[index] = false;
     health_override[index] = HO_OFFLINE;
-    return false;
+    co_return false;
 }
 
 // I2C1 总线恢复: 停止外设 → SDA/SCL 转 GPIO → 检测 SDA 卡低 → 9 时钟 + STOP → 恢复外设
-bool vl53l0x_bus_recover(void)
+Task<bool> bus_recover_job(void)
 {
     // 严格有界: 最多 9 个时钟脉冲 (每个 ~10us) + STOP (~15us) + 两次外设重初始化,
     // 无任何无限等待路径。START 事件由调用者 (tof_reader 状态机) 发布。
 
     // ---- 1. 停止 I2C 外设, 释放引脚 ----
-    i2c_deinit(I2C1_PORT);
+    while (io_claimed || tof_bus.busy()) co_await std::suspend_always{};
+    io_claimed = true;
+    reset_block_mask(1u << I2C_RESET_NUM(I2C1_PORT));
     gpio_set_function(I2C1_SDA, GPIO_FUNC_SIO);
     gpio_set_function(I2C1_SCL, GPIO_FUNC_SIO);
 
@@ -812,7 +794,7 @@ bool vl53l0x_bus_recover(void)
     gpio_pull_up(I2C1_SDA);
     gpio_pull_up(I2C1_SCL);
 
-    busy_wait_us(10);
+    (co_await delay_us(10));
 
     bool sda_low = !gpio_get(I2C1_SDA);
 
@@ -827,26 +809,28 @@ bool vl53l0x_bus_recover(void)
             // SCL 低
             gpio_put(I2C1_SCL, 0);
             gpio_set_dir(I2C1_SCL, GPIO_OUT);
-            busy_wait_us(5);
+            (co_await delay_us(5));
             // SCL 释放 (上拉拉高; 若从机时钟拉伸则保持低, 下一脉冲重试)
             gpio_set_dir(I2C1_SCL, GPIO_IN);
-            busy_wait_us(5);
+            (co_await delay_us(5));
         }
 
         // 4. STOP 条件: SCL 高电平期间 SDA 由低变高
         gpio_set_dir(I2C1_SCL, GPIO_IN);          // 确保 SCL 释放为高
         gpio_put(I2C1_SDA, 0);
         gpio_set_dir(I2C1_SDA, GPIO_OUT);         // SDA 低
-        busy_wait_us(5);
+        (co_await delay_us(5));
         gpio_set_dir(I2C1_SDA, GPIO_IN);          // SDA 释放 → 低变高 = STOP
-        busy_wait_us(10);
+        (co_await delay_us(10));
     }
 
     // ---- 5. 验证总线释放 ----
     bool bus_ok = gpio_get(I2C1_SDA) && gpio_get(I2C1_SCL);
 
     // ---- 6. 重新初始化 I2C1 外设 ----
-    i2c_init(I2C1_PORT, I2C1_FREQ_HZ);
+    tof_bus.init(I2C1_FREQ_HZ);
+    while (tof_bus.busy()) co_await std::suspend_always{};
+    io_claimed = false;
     gpio_set_function(I2C1_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C1_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C1_SDA);
@@ -854,11 +838,11 @@ bool vl53l0x_bus_recover(void)
 
     // 结果事件由调用者 (tof_reader 状态机) 统一发布
 
-    return bus_ok;
+    co_return bus_ok;
 }
 
 // 全传感器恢复: 所有 XSHUT 拉低 → 逐颗释放并完整初始化
-bool vl53l0x_reinit_all(void)
+Task<bool> reinit_all_job(void)
 {
     // 全部下线 + 快照语义由调用者负责
     for (int i = 0; i < 5; i++) {
@@ -868,14 +852,14 @@ bool vl53l0x_reinit_all(void)
         gpio_put(xshut_pins[i], 0);
     }
 
-    sleep_ms(XSHUT_RESET_DELAY_MS);   // 全部复位期间无传感器可轮询, 直接延时即可
+    (co_await delay_us((uint64_t)(XSHUT_RESET_DELAY_MS) * 1000u));   // 全部复位期间无传感器可轮询, 直接延时即可
 
     uint8_t ok_bitmap = 0;
     bool all_ok = true;
     for (int i = 0; i < 5; i++) {
-        recovery_count[i]++;
+        recovery_count[i] = recovery_count[i] + 1;
 
-        if (init_sensor(i)) {
+        if ((co_await init_sensor(i))) {
             sensor_ready[i] = true;
             health_override[i] = HO_NONE;
             uint32_t now = to_ms_since_boot(get_absolute_time());
@@ -894,50 +878,57 @@ bool vl53l0x_reinit_all(void)
     // 汇总事件进队列（Core0 负责 CDC 输出）—— Core1 禁止 printf
     tof_event_post(TOF_EVT_FULL_REINIT_DONE, 0xFF, ok_bitmap);
 
-    return all_ok;
+    co_return all_ok;
 }
 
+#endif
 void vl53l0x_force_offline(uint8_t index)
 {
+#if CHUNI_TOF_RECOVERY_ENABLE
+
     if (index >= 5) return;
     sensor_ready[index] = false;
     health_override[index] = HO_RECOVERING;
+
+#else
+    return;
+#endif
 }
 
 // 存活探测（不改变任何配置, 不产生测距动作）:
 // 总线级恢复后用于甄别 —— 响应的传感器原样保留继续测距,
 // 无响应的传感器才进入各自的 XSHUT 恢复路径。
 // 探测成功时刷新通信时间戳并清零连续错误 (供掉线判定使用)。
-bool vl53l0x_probe_sensor(uint8_t index)
+Task<bool> probe_sensor_job(uint8_t index)
 {
-    if (index >= 5 || !sensor_ready[index]) return false;
+    if (index >= 5 || !sensor_ready[index]) co_return false;
 
-    if (!check_model_id(sensor_addr[index])) {
+    if (!(co_await check_model_id(sensor_addr[index]))) {
         record_comm_error(index);
-        return false;
+        co_return false;
     }
 
     stamp_comm_ok(index);
     consecutive_errors[index] = 0;
-    return true;
+    co_return true;
 }
 
 //==============================================================================
 // 公共 API —— 数据读取
 //==============================================================================
 
-vl53l0x_read_result_t vl53l0x_read_distance_ex(uint8_t index, uint16_t *distance)
+static Task<vl53l0x_read_result_t> read_distance_job(uint8_t index, uint16_t *distance)
 {
-    if (index >= 5) return VL53L0X_READ_NOT_INITIALIZED;
-    if (!sensor_ready[index]) return VL53L0X_READ_NOT_INITIALIZED;
+    if (index >= 5) co_return VL53L0X_READ_NOT_INITIALIZED;
+    if (!sensor_ready[index]) co_return VL53L0X_READ_NOT_INITIALIZED;
 
     const uint8_t addr = sensor_addr[index];
 
     // ---- 检查中断状态: bit0-2 非零 = 新样本就绪 ----
     uint8_t status;
-    if (!read_reg(addr, REG_RESULT_INTERRUPT_STATUS, &status)) {
+    if (!(co_await read_reg(addr, REG_RESULT_INTERRUPT_STATUS, &status))) {
         record_comm_error(index);
-        return VL53L0X_READ_COMM_ERROR;    // 通信失败: 不返回任何数据
+        co_return VL53L0X_READ_COMM_ERROR;    // 通信失败: 不返回任何数据
     }
 
     // 状态寄存器读取成功 = 通信层存活（与是否产出数据无关）
@@ -948,22 +939,22 @@ vl53l0x_read_result_t vl53l0x_read_distance_ex(uint8_t index, uint16_t *distance
         // 连续通信错误计数在此清零（"连续失败"必须是连续的通信失败,
         // 不能把夹杂着成功通信的错误序列累加成掉线依据）
         consecutive_errors[index] = 0;
-        return VL53L0X_READ_NOT_READY;     // 测量进行中（通信正常）
+        co_return VL53L0X_READ_NOT_READY;     // 测量进行中（通信正常）
     }
 
     // ---- 读取距离结果 (0x14 + 10 = 0x1E) ----
     uint16_t range;
-    if (!read_reg16(addr, 0x1E, &range)) {
+    if (!(co_await read_reg16(addr, 0x1E, &range))) {
         record_comm_error(index);
-        return VL53L0X_READ_COMM_ERROR;
+        co_return VL53L0X_READ_COMM_ERROR;
     }
 
     // ---- 清除中断 ----
     // 清除失败绝对不能静默忽略: 否则下一次轮询会读到同一次旧测量结果,
     // 并把它当作"新数据"上报（stale-as-fresh bug）
-    if (!write_reg(addr, REG_SYSTEM_INTERRUPT_CLEAR, 0x01)) {
+    if (!(co_await write_reg(addr, REG_SYSTEM_INTERRUPT_CLEAR, 0x01))) {
         record_comm_error(index);
-        return VL53L0X_READ_COMM_ERROR;
+        co_return VL53L0X_READ_COMM_ERROR;
     }
 
     // ---- 有效性: 0 / 8190+ 为无效测距（保持原语义）----
@@ -976,12 +967,7 @@ vl53l0x_read_result_t vl53l0x_read_distance_ex(uint8_t index, uint16_t *distance
     last_new_data_ms[index] = to_ms_since_boot(get_absolute_time());
 
     if (distance) *distance = range;
-    return VL53L0X_READ_NEW_DATA;
-}
-
-bool vl53l0x_read_distance(uint8_t index, uint16_t *distance)
-{
-    return vl53l0x_read_distance_ex(index, distance) == VL53L0X_READ_NEW_DATA;
+    co_return VL53L0X_READ_NEW_DATA;
 }
 
 uint16_t vl53l0x_get_last_distance(uint8_t index)
@@ -994,19 +980,6 @@ bool vl53l0x_is_ready(uint8_t index)
 {
     if (index >= 5) return false;
     return sensor_ready[index];
-}
-
-bool vl53l0x_has_new_data(uint8_t index)
-{
-    if (index >= 5 || !sensor_ready[index]) return false;
-
-    uint8_t status;
-    if (!read_reg(sensor_addr[index], REG_RESULT_INTERRUPT_STATUS, &status)) {
-        record_comm_error(index);
-        return false;
-    }
-    stamp_comm_ok(index);
-    return (status & 0x07) != 0;
 }
 
 //==============================================================================
@@ -1080,5 +1053,101 @@ void vl53l0x_note_global_stall(uint32_t now_ms)
         }
     }
 }
+
+
+// Exactly one management job (address 0x29 may have only one owner) plus one
+// sampling job. They cooperate via io_claimed, never wait on a mutex.
+static Task<bool> management_job;
+static Task<vl53l0x_read_result_t> sample_job;
+static uint8_t sampling_index = 0xff;
+static uint16_t sampled_distance = 0;
+static volatile uint32_t management_kind = 0;
+static volatile uint32_t published_management = 0;
+
+void vl53l0x_init() {
+    management_kind = 1;
+    management_job = init_all();
+}
+void vl53l0x_task_step() {
+    tof_bus.step();
+    management_job.step();
+    sample_job.step();
+    published_management = management_job.done() ? 0 : management_kind;
+}
+bool vl53l0x_management_busy() { return !management_job.done(); }
+bool vl53l0x_management_result() { return management_job.valid() && management_job.result(); }
+bool vl53l0x_start_recovery(uint8_t index) {
+#if CHUNI_TOF_RECOVERY_ENABLE
+
+    if (!management_job.done() || sample_job.valid() || index >= 5) return false;
+    sensor_ready[index] = false;
+    management_kind = 2;
+    management_job = recover_sensor_job(index);
+    return true;
+
+#else
+    return false;
+#endif
+}
+bool vl53l0x_start_bus_recovery() {
+#if CHUNI_TOF_RECOVERY_ENABLE
+
+    if (!management_job.done() || sample_job.valid()) return false;
+    management_kind = 3;
+    management_job = bus_recover_job();
+    return true;
+
+#else
+    return false;
+#endif
+}
+bool vl53l0x_start_reinit_all() {
+#if CHUNI_TOF_RECOVERY_ENABLE
+
+    if (!management_job.done() || sample_job.valid()) return false;
+    address_conflict = false;
+    management_kind = 4;
+    management_job = reinit_all_job();
+    return true;
+
+#else
+    return false;
+#endif
+}
+bool vl53l0x_start_probe(uint8_t index) {
+#if CHUNI_TOF_RECOVERY_ENABLE
+
+    if (!management_job.done() || sample_job.valid() || index >= 5) return false;
+    management_kind = 5;
+    management_job = probe_sensor_job(index);
+    return true;
+
+#else
+    return false;
+#endif
+}
+vl53l0x_read_result_t vl53l0x_read_distance_ex(uint8_t index, uint16_t* distance) {
+    if (index >= 5) return VL53L0X_READ_NOT_INITIALIZED;
+    if (sample_job.valid()) {
+        if (sampling_index != index || !sample_job.done()) return VL53L0X_READ_PENDING;
+        const auto result = sample_job.result();
+        if (result == VL53L0X_READ_NEW_DATA && distance) *distance = sampled_distance;
+        sample_job.clear();
+        sampling_index = 0xff;
+        return result;
+    }
+    if (!sensor_ready[index]) return VL53L0X_READ_NOT_INITIALIZED;
+    // Bus clear/full reset must have exclusive access, while per-device init
+    // may interleave reads of all other ready sensors.
+    if (!management_job.done() && management_kind >= 3) return VL53L0X_READ_PENDING;
+    sampling_index = index;
+    sample_job = read_distance_job(index, &sampled_distance);
+    return sample_job.valid() ? VL53L0X_READ_PENDING : VL53L0X_READ_COMM_ERROR;
+}
+uint32_t vl53l0x_get_io_phase() { return tof_bus.phase(); }
+uint32_t vl53l0x_get_bus_resets() { return tof_bus.reset_count(); }
+uint32_t vl53l0x_get_management_kind() { return published_management; }
+uint32_t vl53l0x_get_frame_failures() { return TaskFrames::failures; }
+bool vl53l0x_needs_readdress() { return address_conflict; }
 
 } // namespace Chuni245Tof

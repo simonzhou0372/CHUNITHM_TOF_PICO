@@ -243,7 +243,7 @@ I2C1 deinit → GPIO 开漏检测 → 最多 9 个 SCL 时钟 (每个 ~10us) →
 | `src/tof_events.h/.cpp` (新增) | Core1→Core0 非阻塞 SPSC 事件队列 (32 条, 满则丢弃计数) |
 | `src/vl53l0x.cpp` | 移除全部 printf → 事件; 新增 `vl53l0x_note_global_stall()` |
 | `src/tof_reader.cpp` | 移除全部 printf → 事件; 新增全局停顿检测 (150ms 阈值 + 时间基准刷新); 新增 Core1 心跳; `multicore_lockout_victim_init()`; 事件化 BUS RECOVERY / OFFLINE / STALL |
-| `src/vl53l0x.h` / `tof_reader.h` | 新增 API 声明 |
+| `src/vl53l0x.h` / `tof_reader.h` | 新增 API 声明; **`CHUNI_TOF_RECOVERY_ENABLE` 恢复总开关 (默认 0 = 禁用)** |
 | `src/main.cpp` | tud_task 最大间隔统计; HID busy/发送间隔统计; monitor 分块背压输出; cdc_task 1ms 上限 + 命令背压丢弃; Core1 事件泵; STATUS/PERF 扩展 |
 | `src/save.cpp/.h` | `save_request_write` 延迟保存; `save_loop` 执行; Flash 擦写加 multicore lockout 保护 Core1 |
 | `src/config.cpp` | `config_save()` 改走延迟队列 |
@@ -252,6 +252,47 @@ I2C1 deinit → GPIO 开漏检测 → 最多 9 个 SCL 时钟 (每个 ~10us) →
 未修改: AIR 层级/判定算法、MPR121 工作逻辑、TimingBudget、恢复分级架构、
 I2C 引脚定义。清理项: `attempt_recovery` 中重复赋值经核查**并不存在**
 (源码仅一处 `last_attempt_ms` 赋值), 无需修改。
+
+### Recovery 总开关 (CHUNI_TOF_RECOVERY_ENABLE, vl53l0x.h)
+
+编译期宏, **默认 0 (禁用)**:
+
+- **0 = 禁用 (默认)**: **纯轮询模式 —— 完全不检测掉线**。掉线检测 (Level 1)
+  整体编译剔除: 不存在下线判定、不停止任何传感器的 I2C 流量、
+  不做快照失效、不发送 OFFLINE 事件、不执行任何 XSHUT 复位 /
+  总线恢复 / 全量重初始化。传感器无论通信是否正常都持续轮询,
+  I2C 错误只进入驱动错误计数器, 直到整机重启。
+  恢复专用代码 (Level 1/2/3/4 状态机) 整体编译剔除。
+  代价: 若传感器损坏 (NACK 无响应), 每轮轮询仍会对该传感器做
+  I2C 访问并等超时 (~3ms), 5 颗全部损坏时每轮最多增加 ~15ms;
+  I2C 超时本身有界, 不会阻塞 Core0/USB。
+- **1 = 启用**: 完整分级恢复架构 (本报告 §7 的全部路径)。
+
+### printf 全局禁用 (只发送 HID 报文)
+
+实测发现 CDC 输出仍可在特定条件下使 USB 完全停发, 根因是 SDK stdio 的
+USB CDC 后端 (`stdio_usb_out_chars`):
+
+- 当 DTR 已连接 (有串口程序打开过端口) 且 TX FIFO (256B) 填满、
+  主机不再读取时, **每次 printf 调用阻塞最多 500ms**
+  (`PICO_STDIO_USB_STDOUT_TIMEOUT_US`, SDK 2.3.0 默认 500000us);
+- 阻塞期间 `tud_task()` 得不到调用, HID endpoint 失去服务;
+- CDC 背压门控只保护了 monitor/事件/命令路径, 但 TX FIFO 的填满时刻
+  由字节量决定 —— 与实测 "每次传输大致相同数据量后掉线" 吻合。
+
+修复 (三重隔离):
+
+1. `main.cpp` / `mpr121.cpp` / `save.cpp` / `config.cpp` 顶部
+   `#define printf(...) ((void)0)` —— 全部 printf (含参数求值) 编译为空操作;
+2. `CMakeLists.txt`: `pico_enable_stdio_usb(0)` + `stdio_uart(0)` ——
+   SDK 的 stdio_usb 后端 (互斥锁 + 500ms 重试循环) 完全不参与编译/链接
+   (已用 ELF 符号验证: `stdio_usb_out_chars` / `stdio_usb_mutex` 不存在);
+3. 主循环中 monitor 输出与 ToF 事件输出调用点注释关闭。
+
+保留: CDC 接口仍枚举 (仅接收命令, `BOOTLOADER` 等命令仍可用但无文本回复),
+`snprintf` (缓冲区格式化) 不受影响, save_loop / Flash 保存机制不受影响。
+- PERF 命令可查看当前固件的 `recovery: enabled/disabled`。
+- 两种配置均已编译验证通过。
 
 ## 12. TimingBudget Verification
 

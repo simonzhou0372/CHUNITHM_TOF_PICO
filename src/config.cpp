@@ -13,6 +13,8 @@
 #include "mpr121.h"  // 引入 MPR121 默认阈值定义
 #include <string.h>
 #include <stdio.h>
+// 注意: log_output.h 必须在所有 SDK/系统头之后 (见 mpr121.cpp 同名注释)
+#include "log_output.h"   // printf 总开关 (默认禁用, 只发送 HID 报文)
 
 namespace Chuni245Tof {
 

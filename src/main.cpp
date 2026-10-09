@@ -18,6 +18,8 @@
 #include "pico/bootrom.h"
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
+#include "hardware/watchdog.h"
+#include "hardware/timer.h"
 #include "tusb.h"
 #include "class/cdc/cdc_device.h"
 
@@ -31,8 +33,35 @@
 #include "tof_events.h"
 #include "air.h"
 #include "button.h"
+#include "log_output.h"   // printf 总开关 (默认禁用, 只发送 HID 报文)
 
 using namespace Chuni245Tof;
+extern "C" bool chuni_dcd_task(void);
+extern "C" uint32_t chuni_dcd_timeout_count(void);
+static bool usb_reinit_pending = false;
+static uint64_t usb_reinit_at = 0;
+static uint64_t bootloader_at = 0;
+
+static void service_usb() {
+#if CHUNI_FAULT_RECOVERY_ENABLE
+    if (usb_reinit_pending) {
+        if (time_us_64() >= usb_reinit_at) {
+            tusb_init();
+            usb_reinit_pending = false;
+        }
+        return;
+    }
+    if (!chuni_dcd_task()) {
+        tud_deinit(0);
+        usb_reinit_pending = true;
+        usb_reinit_at = time_us_64() + 250000;
+        return;
+    }
+#else
+    (void)chuni_dcd_task(); // service hardware, never reinitialize USB
+#endif
+    tud_task_ext(0, false);
+}
 
 // Physical button pins
 #define BUTTON_ENTER_PIN  18  // GP18 - Barrier mode 1 selection at startup
@@ -70,6 +99,65 @@ static volatile uint64_t hid_busy_since_us = 0;      // 连续 not-ready 起点 
 static volatile uint32_t max_hid_not_ready_us = 0;   // 连续 not-ready 最长持续时间
 static volatile uint32_t max_hid_send_gap_us = 0;    // 两次成功 HID 发送的最大间隔
 
+//==============================================================================
+// USB 健康状态 (部分关键指标可经 USBSTATUS 读取, 不依赖 printf)
+//
+// 用于区分四类故障 (发生 USB 无输入后逐项核对):
+//   A. tud_mounted()==false        → 枚举/主机连接层问题 (unmount_count 增加)
+//   B. mounted + suspended         → 主机 USB suspend (不是 HID 故障)
+//   C. mounted + 非suspend + HID not-ready 持续很久 → endpoint 卡死
+//      (max_hid_busy_us 增大, 超阈值触发受控重枚举 usb_recovery_count++)
+//   D. mounted + HID ready 但发送失败 → 栈异常 (hid_send_fail_count 增加)
+//==============================================================================
+typedef struct {
+    uint32_t mount_count;
+    uint32_t unmount_count;
+    uint32_t suspend_count;
+    uint32_t resume_count;
+    uint32_t hid_send_count;
+    uint32_t hid_send_fail_count;
+    uint32_t usb_recovery_count;    // 受控重枚举执行次数
+    uint32_t max_tud_gap_us;        // 两次 tud_task() 的最大间隔
+    uint32_t max_hid_busy_us;       // HID endpoint 连续 not-ready 的最长持续时间
+    uint64_t last_mount_us;
+    uint64_t last_unmount_us;
+    uint64_t last_suspend_us;
+    uint64_t last_resume_us;
+    uint64_t last_hid_send_us;
+} usb_health_t;
+
+static usb_health_t usb_health;
+static volatile bool usb_mounted = false;     // tud_mount_cb / tud_umount_cb 维护
+static volatile bool usb_suspended = false;   // tud_suspend_cb / tud_resume_cb 维护
+// IRQ only reads this byte, never a possibly torn 64-bit Core0 timestamp.
+static volatile bool hid_stalled_for_led = false;
+
+// ---- HID endpoint watchdog (仅 mounted + 非 suspended 时计时) ----
+// ★ 自动恢复默认关闭 (CHUNI_USB_AUTO_RECOVERY_ENABLE=0) ★
+// 原因: 恢复动作 (tud_disconnect/tud_connect) 本身就是一次 USB 断开重连,
+// 主机侧表现与掉线完全相同 —— 自动恢复会把 "一次真死" 变成 "反复断连",
+// 且误判条件 (如主机选择性挂起) 会造成周期性自断连。默认只统计不干预;
+// 确认需要时把宏改为 1 再启用受控重枚举。
+// Recovery switches are grouped in vl53l0x.h.
+
+static const uint32_t HID_STALL_RECOVERY_MS = 5000;    // not-ready 持续阈值
+static const uint32_t USB_RECOVERY_COOLDOWN_MS = 3000; // 两次受控重枚举最小间隔
+static uint64_t hid_not_ready_since_us = 0;            // 本轮 not-ready 起点 (0 = ready)
+static uint64_t last_usb_recovery_us = 0;
+#if CHUNI_USB_AUTO_RECOVERY_ENABLE
+static bool usb_disconnect_pending = false;            // disconnect 后等待延迟重连
+static uint64_t usb_disconnect_at_us = 0;
+#endif
+
+// ---- 复位原因/启动计数 ----
+// boot_count 放在 .uninitialized_data 段: SRAM 保留的复位可能保留此值。
+// 断电/欠压后的 SRAM 不可靠, magic 不匹配时重新计数; 不能据此证明 brownout。
+// USBSTATUS 的 wdt 才是 watchdog_caused_reboot() 读取的硬件复位证据。
+#define BOOT_MAGIC 0x43485531u  // "CHU1"
+static volatile uint32_t boot_magic __attribute__((section(".uninitialized_data")));
+static volatile uint32_t boot_count __attribute__((section(".uninitialized_data")));
+static bool reboot_by_watchdog = false;
+
 // 性能统计
 static volatile uint32_t main_loop_count = 0;
 static volatile uint32_t main_loop_max_us = 0;
@@ -83,8 +171,79 @@ static volatile uint64_t last_monitor_time = 0;
 static volatile uint32_t monitor_truncated_count = 0; // CDC 背压导致被截断的 monitor 输出次数
 static volatile uint32_t cdc_cmd_dropped_count = 0;   // CDC 背压导致被丢弃的命令条数
 
+// Core0 各任务最大执行时间 (定位 "tud_task gap" 的真正来源; 低成本统计:
+// 每任务一次 start/end + max 比较, 不产生任何输出)
+static volatile uint32_t cdc_task_max_us = 0;
+static volatile uint32_t slider_update_max_us = 0;
+static volatile uint32_t air_update_max_us = 0;
+static volatile uint32_t hid_task_max_us = 0;   // gen_nkro_report + report_usb_hid
+static volatile uint32_t save_loop_max_us = 0;
+static volatile uint32_t cmd_step_max_us = 0;    // 单条 CDC 命令执行耗时
+
+// sent_hid_nkro 是否有效: USB 重枚举后置 false, 强制下一轮完整重发当前状态
+// (用户无需重新按键 HID 就能恢复输出)
+static bool sent_valid = false;
+
 static char cdc_rx_buf[256];
 static uint8_t cdc_rx_pos = 0;
+
+// ---- CDC 命令队列 ----
+// ★ cdc_task 只负责 "接收+解析+入队", 绝不在 CDC 路径执行命令。
+//   执行由主循环 command_step() 完成, 每轮最多 1 条 —— 即使命令处理
+//   路径出现未预期耗时, 也只会延后而不是累积阻塞主循环。
+#define CDC_CMD_QUEUE_DEPTH 4
+static char cdc_cmd_queue[CDC_CMD_QUEUE_DEPTH][256];
+static volatile uint8_t cdc_cmd_q_head = 0;   // 生产者: cdc_task
+static volatile uint8_t cdc_cmd_q_tail = 0;   // 消费者: command_step
+static volatile uint32_t cdc_cmd_queue_full_count = 0;
+
+// ---- 主循环 stage 面包屑 (硬锁现场留存) ----
+// 写入 .uninitialized_data 段: 看门狗复位时保留, 断电后的值不可靠。
+// 看门狗复位后从 prev_stage 即可读出卡死位置, 不再是 "黑盒重启"。
+typedef enum {
+    MAIN_STAGE_IDLE = 0,     // 上电未进入主循环
+    MAIN_STAGE_TUD_TASK,     // TinyUSB 协议栈
+    MAIN_STAGE_CDC_TASK,     // CDC 接收/解析/入队
+    MAIN_STAGE_CMD_STEP,     // CDC 命令执行 (每轮最多 1 条)
+    MAIN_STAGE_SLIDER,       // MPR121 轮转轮询 + 异步命令状态机
+    MAIN_STAGE_AIR,          // ToF 快照消费
+    MAIN_STAGE_BUTTON,       // 物理按钮
+    MAIN_STAGE_HID,          // HID 报文生成/发送 + watchdog
+    MAIN_STAGE_SAVE,         // 延迟 Flash 保存
+    MAIN_STAGE_LOOP_END,     // 一轮完整结束 (喂狗点)
+    MAIN_STAGE_SENSOR_INIT,  // 冷启动传感器初始化 (8s 看门狗保护)
+} main_stage_t;
+
+static volatile uint32_t last_main_stage __attribute__((section(".uninitialized_data")));
+static volatile uint32_t last_stage_enter_us __attribute__((section(".uninitialized_data")));
+static volatile uint32_t loop_completed_count __attribute__((section(".uninitialized_data")));
+
+// 上一次生命周期 (看门狗复位前) 的现场快照, main() 开头捕获
+static uint32_t crash_prev_stage = 0;
+static uint32_t crash_prev_stage_us = 0;
+static uint32_t crash_prev_loops = 0;
+
+#define STAGE_ENTER(st) do { \
+    last_main_stage = (uint32_t)(st); \
+    last_stage_enter_us = time_us_32(); \
+} while (0)
+
+static const char* main_stage_name(uint32_t st) {
+    switch (st) {
+        case MAIN_STAGE_IDLE:     return "IDLE";
+        case MAIN_STAGE_TUD_TASK: return "TUD_TASK";
+        case MAIN_STAGE_CDC_TASK: return "CDC_TASK";
+        case MAIN_STAGE_CMD_STEP: return "CMD_STEP";
+        case MAIN_STAGE_SLIDER:   return "SLIDER";
+        case MAIN_STAGE_AIR:      return "AIR";
+        case MAIN_STAGE_BUTTON:   return "BUTTON";
+        case MAIN_STAGE_HID:      return "HID";
+        case MAIN_STAGE_SAVE:     return "SAVE";
+        case MAIN_STAGE_LOOP_END: return "LOOP_END";
+        case MAIN_STAGE_SENSOR_INIT: return "SENSOR_INIT";
+        default:                  return "?";
+    }
+}
 
 // HID Key codes (HID Usage Table)
 #define HID_KEY_A       0x04
@@ -216,6 +375,7 @@ static void gen_nkro_report() {
 
 // Send HID report
 static void report_usb_hid() {
+    if (usb_reinit_pending) return;
     uint64_t now = time_us_64();
 
     // 检查 USB 是否就绪（非阻塞 —— busy 时保持 dirty 标志, 状态继续更新,
@@ -235,7 +395,9 @@ static void report_usb_hid() {
     hid_busy_since_us = 0;   // 连续 busy 结束
 
     // 检查是否有状态变化
-    bool state_changed = (memcmp(&hid_nkro, &sent_hid_nkro, sizeof(hid_nkro)) != 0);
+    // sent_valid=false (USB 重枚举后) 强制完整重发当前状态
+    bool state_changed = !sent_valid ||
+                         (memcmp(&hid_nkro, &sent_hid_nkro, sizeof(hid_nkro)) != 0);
 
     if (state_changed || hid_dirty) {
         // 状态变化立即发送; 或之前因 USB busy 延迟发送, 现在重试
@@ -245,13 +407,85 @@ static void report_usb_hid() {
                 max_hid_send_gap_us = gap_us;
             }
             sent_hid_nkro = hid_nkro;
+            sent_valid = true;
             hid_dirty = false;
             last_hid_send_time = now;
+            usb_health.last_hid_send_us = now;
             hid_send_count++;
+            usb_health.hid_send_count++;
+        } else {
+            // ready 但 report 失败: HID 接口/设备栈异常 (故障分类 D)
+            usb_health.hid_send_fail_count++;
+            hid_dirty = true;
         }
     }
     // 如果状态未变化且没有 dirty，不发送（节省带宽）
 }
+
+//==============================================================================
+// HID endpoint watchdog + 受控 USB 重枚举 (仅 Core0 主循环调用)
+//
+// mounted + 非 suspended + !tud_hid_n_ready(0) 持续超过 HID_STALL_RECOVERY_MS
+// 才判定 transport 异常; 恢复手段是 TinyUSB 软断开/重连 (tud_disconnect 清除
+// 上拉 → 主机看到物理拔出 → tud_connect 重新枚举), 不重启 MCU、不动
+// tusb_init 生命周期、不碰任何 I2C/Flash。带冷却时间防循环。
+//==============================================================================
+#if CHUNI_FAULT_RECOVERY_ENABLE
+static void usb_hid_watchdog() {
+    if (usb_reinit_pending) {
+        usb_mounted = false;
+        usb_suspended = false;
+        hid_stalled_for_led = false;
+        hid_not_ready_since_us = 0;
+        return;
+    }
+    uint64_t now = time_us_64();
+    // Bus reset need not produce an umount callback; use stack state as truth.
+    usb_mounted = tud_mounted();
+    usb_suspended = tud_suspended();
+    hid_stalled_for_led = false;
+
+#if CHUNI_USB_AUTO_RECOVERY_ENABLE
+    // 延迟重连: disconnect 后保持 250ms, 给主机足够的分离检测时间
+    if (usb_disconnect_pending && now - usb_disconnect_at_us >= 250000) {
+        usb_disconnect_pending = false;
+        tud_connect();
+    }
+#endif
+
+    if (!usb_mounted || usb_suspended) {
+        hid_not_ready_since_us = 0;   // 非正常枚举状态: 不判 endpoint 卡死
+        return;
+    }
+
+    if (!tud_hid_n_ready(0)) {
+        if (hid_not_ready_since_us == 0) {
+            hid_not_ready_since_us = now;
+        }
+        uint32_t busy_us = (uint32_t)(now - hid_not_ready_since_us);
+        hid_stalled_for_led = busy_us > 100000;
+        if (busy_us > usb_health.max_hid_busy_us) {
+            usb_health.max_hid_busy_us = busy_us;
+        }
+
+#if CHUNI_USB_AUTO_RECOVERY_ENABLE
+        if (now - hid_not_ready_since_us >= (uint64_t)HID_STALL_RECOVERY_MS * 1000) {
+            if (now - last_usb_recovery_us >= (uint64_t)USB_RECOVERY_COOLDOWN_MS * 1000) {
+                usb_health.usb_recovery_count++;
+                last_usb_recovery_us = now;
+                tud_disconnect();               // 受控软断开
+                usb_disconnect_pending = true;
+                usb_disconnect_at_us = now;
+            }
+            hid_not_ready_since_us = now;       // 重置窗口, 由重枚举后的状态决定
+        }
+#endif
+    } else {
+        hid_not_ready_since_us = 0;
+    }
+}
+#endif
+
 
 // ==============================================================================
 // CDC 背压控制 (HID 是实时通道, CDC 是调试通道 —— CDC 绝不能阻塞 HID)
@@ -266,7 +500,7 @@ static void report_usb_hid() {
 
 // 主机是否在读取: 已连接 且 TX 缓冲区有足够剩余空间
 static bool cdc_output_ready(uint32_t need_bytes) {
-    return tud_cdc_connected() && tud_cdc_n_write_available(0) >= need_bytes;
+    return !usb_reinit_pending && tud_cdc_connected() && tud_cdc_n_write_available(0) >= need_bytes;
 }
 
 // 受控输出一小块: 空间不足返回 false (调用者放弃剩余输出)
@@ -379,8 +613,60 @@ static void tof_event_task() {
     }
 }
 
+// Always available, even with printf disabled. One bounded reply, no wait or
+// retry if the host stops reading. All TinyUSB calls remain on Core0.
+static void usb_status_reply() {
+    static char reply[256];
+    int len = snprintf(reply, sizeof(reply),
+        "USB boot=%lu wdt=%u prev=%s loops=%lu core1=%lu gap_us=%lu "
+        "mpr=%lu,%lu,%lu mount=%u suspend=%u sys_khz=%lu usb_abort=%lu rev=20260920\r\n",
+        (unsigned long)boot_count, reboot_by_watchdog ? 1u : 0u,
+        main_stage_name(crash_prev_stage), (unsigned long)crash_prev_loops,
+        (unsigned long)tof_reader_get_heartbeat(),
+        (unsigned long)max_tud_task_interval_us,
+        (unsigned long)mpr121_get_error_count(0),
+        (unsigned long)mpr121_get_error_count(1),
+        (unsigned long)mpr121_get_error_count(2),
+        tud_mounted() ? 1u : 0u, tud_suspended() ? 1u : 0u,
+        (unsigned long)(clock_get_hz(clk_sys) / 1000),
+        (unsigned long)chuni_dcd_timeout_count());
+    if (len <= 0 || len >= (int)sizeof(reply) || !cdc_output_ready((uint32_t)len)) {
+        return;
+    }
+    tud_cdc_n_write(0, reply, (uint32_t)len);
+    tud_cdc_n_write_flush(0);
+}
+
+static void tof_status_reply() {
+    static char reply[256];
+    uint32_t ready = 0;
+    for (int i = 0; i < 5; ++i) if (vl53l0x_is_ready(i)) ready |= 1u << i;
+    int len = snprintf(reply, sizeof(reply),
+        "TOF hb=%lu age_us=%lu stage=%lu job=%lu io=%lu ready=%02lx reset=%lu "
+        "frames_fail=%lu err=%lu,%lu,%lu,%lu,%lu usb_abort=%lu data_ms=%lu,%lu,%lu,%lu,%lu\r\n",
+        (unsigned long)tof_reader_get_heartbeat(), (unsigned long)tof_reader_get_progress_age_us(),
+        (unsigned long)tof_reader_get_stage(), (unsigned long)vl53l0x_get_management_kind(),
+        (unsigned long)vl53l0x_get_io_phase(), (unsigned long)ready,
+        (unsigned long)vl53l0x_get_bus_resets(), (unsigned long)vl53l0x_get_frame_failures(),
+        (unsigned long)vl53l0x_get_error_count(0), (unsigned long)vl53l0x_get_error_count(1),
+        (unsigned long)vl53l0x_get_error_count(2), (unsigned long)vl53l0x_get_error_count(3),
+        (unsigned long)vl53l0x_get_error_count(4), (unsigned long)chuni_dcd_timeout_count(),
+        (unsigned long)tof_reader_get_age(0), (unsigned long)tof_reader_get_age(1),
+        (unsigned long)tof_reader_get_age(2), (unsigned long)tof_reader_get_age(3),
+        (unsigned long)tof_reader_get_age(4));
+    if (len > 0 && len < (int)sizeof(reply) && cdc_output_ready((uint32_t)len)) {
+        tud_cdc_n_write(0, reply, (uint32_t)len);
+        tud_cdc_n_write_flush(0);
+    }
+}
+
 // CDC command handler
 static void cdc_process_command(const char* cmd) {
+    if (strcmp(cmd, "TOFSTATUS") == 0) { tof_status_reply(); return; }
+    if (strcmp(cmd, "USBSTATUS") == 0) {
+        usb_status_reply();
+        return;
+    }
     // Parse CONFIG command: CONFIG touch release offset pitch [air12_range] [min_hold] [overlay]
     if (strncmp(cmd, "CONFIG ", 7) == 0) {
         int touch, release, offset, pitch, air12_range, min_hold, overlay;
@@ -508,7 +794,40 @@ static void cdc_process_command(const char* cmd) {
         printf("    \"tof\": [%lu, %lu, %lu, %lu, %lu]\r\n",
                vl53l0x_get_error_count(0), vl53l0x_get_error_count(1), vl53l0x_get_error_count(2),
                vl53l0x_get_error_count(3), vl53l0x_get_error_count(4));
-        printf("  }\r\n");
+        printf("  },\r\n");
+        printf("  \"usb\": {\r\n");
+        printf("    \"mounted\": %d,\r\n", usb_mounted ? 1 : 0);
+        printf("    \"suspended\": %d,\r\n", usb_suspended ? 1 : 0);
+        printf("    \"mount\": %lu, \"unmount\": %lu,\r\n",
+               (unsigned long)usb_health.mount_count, (unsigned long)usb_health.unmount_count);
+        printf("    \"suspend\": %lu, \"resume\": %lu,\r\n",
+               (unsigned long)usb_health.suspend_count, (unsigned long)usb_health.resume_count);
+        printf("    \"hid_send\": %lu, \"hid_send_fail\": %lu,\r\n",
+               (unsigned long)usb_health.hid_send_count, (unsigned long)usb_health.hid_send_fail_count);
+        printf("    \"recovery\": %lu, \"max_hid_busy_us\": %lu,\r\n",
+               (unsigned long)usb_health.usb_recovery_count, (unsigned long)usb_health.max_hid_busy_us);
+        printf("    \"max_tud_gap_us\": %lu,\r\n", (unsigned long)usb_health.max_tud_gap_us);
+        printf("    \"boot_count\": %lu, \"wdt_reboot\": %d, \"cmdq_full\": %lu\r\n",
+               (unsigned long)boot_count, reboot_by_watchdog ? 1 : 0,
+               (unsigned long)cdc_cmd_queue_full_count);
+        printf("  },\r\n");
+        printf("  \"crash\": {\r\n");
+        printf("    \"prev_stage\": \"%s\" (%lu), \"prev_stage_us\": %lu,\r\n",
+               main_stage_name(crash_prev_stage), (unsigned long)crash_prev_stage,
+               (unsigned long)crash_prev_stage_us);
+        printf("    \"prev_loops\": %lu, \"loops_total\": %lu\r\n",
+               (unsigned long)crash_prev_loops, (unsigned long)loop_completed_count);
+        printf("  },\r\n");
+        printf("  \"task_max_us\": {\r\n");
+        printf("    \"cdc\": %lu, \"cmd\": %lu, \"slider\": %lu, \"air\": %lu, \"hid\": %lu, \"save\": %lu\r\n",
+               (unsigned long)cdc_task_max_us, (unsigned long)cmd_step_max_us,
+               (unsigned long)slider_update_max_us,
+               (unsigned long)air_update_max_us, (unsigned long)hid_task_max_us,
+               (unsigned long)save_loop_max_us);
+        printf("  },\r\n");
+        printf("  \"save\": {\"count\": %lu, \"fail\": %lu, \"max_us\": %lu}\r\n",
+               (unsigned long)save_get_count(), (unsigned long)save_get_fail_count(),
+               (unsigned long)save_get_max_duration_us());
         printf("}\r\n");
     }
     else if (strcmp(cmd, "AIRDEBUG") == 0) {
@@ -559,12 +878,35 @@ static void cdc_process_command(const char* cmd) {
         printf("    monitor truncated: %lu\r\n", monitor_truncated_count);
         printf("    commands dropped: %lu\r\n", cdc_cmd_dropped_count);
         printf("    tof events dropped: %lu\r\n", tof_event_dropped_count());
+        printf("  Recovery:\r\n");
+        printf("    enabled: %d\r\n", CHUNI_TOF_RECOVERY_ENABLE);
         printf("  Core1 TOF:\r\n");
         printf("    new_data: %lu\r\n", tof_reader_get_new_data_count());
         printf("    poll_avg: %lu us\r\n", tof_reader_get_avg_poll_interval_us());
         printf("    poll_max: %lu us\r\n", tof_reader_get_max_poll_interval_us());
         printf("    core1_heartbeat: %lu\r\n", tof_reader_get_heartbeat());
         printf("    last_stall: %lu us\r\n", tof_reader_get_last_stall_us());
+        printf("  USB lifecycle:\r\n");
+        printf("    mounted/suspended: %d/%d\r\n", usb_mounted ? 1 : 0, usb_suspended ? 1 : 0);
+        printf("    mount/unmount: %lu/%lu\r\n",
+               (unsigned long)usb_health.mount_count, (unsigned long)usb_health.unmount_count);
+        printf("    suspend/resume: %lu/%lu\r\n",
+               (unsigned long)usb_health.suspend_count, (unsigned long)usb_health.resume_count);
+        printf("    hid send/fail: %lu/%lu\r\n",
+               (unsigned long)usb_health.hid_send_count, (unsigned long)usb_health.hid_send_fail_count);
+        printf("    usb recoveries: %lu\r\n", (unsigned long)usb_health.usb_recovery_count);
+        printf("    max hid busy: %lu us\r\n", (unsigned long)usb_health.max_hid_busy_us);
+        printf("    boot count: %lu (wdt reboot: %d)\r\n",
+               (unsigned long)boot_count, reboot_by_watchdog ? 1 : 0);
+        printf("  Per-task max (us):\r\n");
+        printf("    cdc=%lu slider=%lu air=%lu hid=%lu save=%lu\r\n",
+               (unsigned long)cdc_task_max_us, (unsigned long)slider_update_max_us,
+               (unsigned long)air_update_max_us, (unsigned long)hid_task_max_us,
+               (unsigned long)save_loop_max_us);
+        printf("  Flash save:\r\n");
+        printf("    count/fail: %lu/%lu, max duration: %lu us\r\n",
+               (unsigned long)save_get_count(), (unsigned long)save_get_fail_count(),
+               (unsigned long)save_get_max_duration_us());
     }
     else if (strcmp(cmd, "SLIDER") == 0) {
         printf("Raw slider state: 0x%08lX\r\n", slider_get_state());
@@ -614,8 +956,7 @@ static void cdc_process_command(const char* cmd) {
     }
     else if (strcmp(cmd, "BOOTLOADER") == 0) {
         printf("OK\r\n");
-        sleep_ms(100);
-        reset_usb_boot(0, 0);
+        bootloader_at = time_us_64() + 100000;
     }
     else if (strcmp(cmd, "DEBUG") == 0) {
         // 打印 MPR121 调试信息: Baseline / FilteredData / Delta
@@ -668,7 +1009,17 @@ static void cdc_process_command(const char* cmd) {
 }
 
 // CDC task - Non-blocking
+// 每轮主循环最多执行 1 条 CDC 命令 (从队列取队头)
+static void command_step() {
+    if (cdc_cmd_q_head == cdc_cmd_q_tail) return;   // 队列空
+    char cmd[256];
+    strcpy(cmd, cdc_cmd_queue[cdc_cmd_q_tail]);
+    cdc_cmd_q_tail = (uint8_t)((cdc_cmd_q_tail + 1) % CDC_CMD_QUEUE_DEPTH);
+    cdc_process_command(cmd);
+}
+
 static void cdc_task() {
+    if (usb_reinit_pending) return;
     // Limit the number of bytes processed per call to avoid blocking
     // 如果CDC有大量数据，每轮最多处理64字节
     const int MAX_CDC_READ_PER_LOOP = 64;
@@ -684,13 +1035,15 @@ static void cdc_task() {
         if (c == '\r' || c == '\n') {
             if (cdc_rx_pos > 0) {
                 cdc_rx_buf[cdc_rx_pos] = '\0';
-                // 命令回复可能产生数百字节输出: 主机已连接但停止读取
-                // (TX 缓冲接近满) 时丢弃本条命令, 防止 printf 进入
-                // stdio CDC 后端的 500ms 阻塞重试路径
-                if (cdc_output_ready(192)) {
-                    cdc_process_command(cdc_rx_buf);
+                // ★ 只入队, 不执行 (旧实现: 在 CDC 解析路径同步执行
+                //   CONFIG/DEFAULT/RESET/DEBUG 等长命令, 阻塞主循环
+                //   数百 ms ~ 秒级)。执行交给主循环 command_step()。
+                uint8_t next = (uint8_t)((cdc_cmd_q_head + 1) % CDC_CMD_QUEUE_DEPTH);
+                if (next == cdc_cmd_q_tail) {
+                    cdc_cmd_queue_full_count++;
                 } else {
-                    cdc_cmd_dropped_count++;
+                    strcpy(cdc_cmd_queue[cdc_cmd_q_head], cdc_rx_buf);
+                    cdc_cmd_q_head = next;
                 }
                 cdc_rx_pos = 0;
             }
@@ -702,9 +1055,87 @@ static void cdc_task() {
     }
 }
 
+// NKRO report: 1 modifier + 15 keymap bytes = 16 (与 HID report descriptor
+// 的 8+120 bit Input 定义、endpoint 64B 上限三者一致)
+static_assert(sizeof(hid_nkro) == 16, "NKRO report must be 16 bytes");
+
+// ===== LED 生命信号 (硬件定时器 IRQ, 与主循环解耦) =====
+// 10ms tick. 优先级从高到低:
+//   常亮         : 主循环卡死 (某 stage 停留 >50ms; 正常每 ~1ms 刷新)
+//   100ms 快闪   : USB 未 mounted (枚举/连接层)
+//   1000ms 慢闪  : USB suspended (主机挂起)
+//   250ms 闪     : HID endpoint not-ready 持续 >100ms
+//   500ms 心跳   : 一切正常
+#define LED_TICK_US 10000
+static repeating_timer_t led_timer;
+static volatile uint32_t led_tick_count = 0;
+
+static bool led_timer_cb(repeating_timer_t *rt) {
+    (void)rt;
+    led_tick_count++;
+
+    // 卡死判定: 未到达 LOOP_END 且单 stage 停留 >50ms
+    // (uint32 减法天然容忍 time_us_32 回绕)
+#if CHUNI_FAULT_RECOVERY_ENABLE
+    bool loop_stalled = (last_main_stage != (uint32_t)MAIN_STAGE_LOOP_END) &&
+                        ((time_us_32() - last_stage_enter_us) > 50000);
+
+    bool on;
+    if (loop_stalled) {
+        on = true;                          // 常亮: Core0 卡死证据
+    } else if (!usb_mounted) {
+        on = (led_tick_count % 10) < 5;     // 100ms 快闪
+    } else if (usb_suspended) {
+        on = (led_tick_count % 100) < 50;   // 1000ms 慢闪
+    } else if (hid_stalled_for_led) {
+        on = (led_tick_count % 25) < 13;    // 250ms 闪
+    } else {
+        on = (led_tick_count % 50) < 25;    // 500ms 心跳
+    }
+
+
+#else
+    bool on = (led_tick_count % 50) < 25; // heartbeat only
+#endif
+    static bool last_on = false;
+    if (on != last_on) {
+        gpio_put(LED_PIN, on ? 1 : 0);
+        last_on = on;
+    }
+    return true;   // 继续周期触发
+}
+
 int main(void) {
-    set_sys_clock_khz(150000, true);
-    stdio_init_all();
+    // Use Pico's conservative 125 MHz clock during stability qualification.
+    // I2C baud rates and sensor timing budgets are configured independently.
+    set_sys_clock_khz(125000, true);
+    // 注意: 不调用 stdio_init_all() —— 本工程 stdio 输出后端全部关闭
+    // (CMakeLists: pico_enable_stdio_usb/uart = 0), USB device 栈的唯一
+    // 所有者是 tusb_init() 的 TinyUSB 生命周期。
+
+    // ===== 复位原因 / 启动计数 (SRAM 保留时有效, magic 校验) =====
+    bool retained_state_valid = boot_magic == BOOT_MAGIC;
+    if (retained_state_valid) {
+        boot_count++;
+    } else {
+        boot_magic = BOOT_MAGIC;
+        boot_count = 1;
+    }
+    reboot_by_watchdog = watchdog_caused_reboot();
+
+    // 捕获上一次生命周期的硬锁现场 (看门狗复位时 last_main_stage 即
+    // 卡死位置)。断电冷启动时 .uninitialized_data 为随机值, 仅在
+    // wdt_reboot=1 时解读。
+    if (retained_state_valid && reboot_by_watchdog) {
+        crash_prev_stage = last_main_stage;
+        crash_prev_stage_us = last_stage_enter_us;
+        crash_prev_loops = loop_completed_count;
+    }
+    loop_completed_count = 0;
+    // 为本次生命周期初始化面包屑 (冷启动时 .uninitialized_data 为随机值,
+    // 若不初始化, LED stage-stall 判定会在进入主循环前误报常亮)
+    last_main_stage = (uint32_t)MAIN_STAGE_IDLE;
+    last_stage_enter_us = time_us_32();
 
     // Initialize LED
     gpio_init(LED_PIN);
@@ -757,8 +1188,6 @@ int main(void) {
     }
     printf("\n");
 
-    tusb_init();
-
     static mutex_t lock;
     mutex_init(&lock);
 
@@ -773,6 +1202,12 @@ int main(void) {
     save_init(0xCA34CAFE, &lock);
 
     printf("Initializing sensors...\r\n");
+    // Cover initialization too: otherwise a fault after watchdog reset can
+    // leave the LED lit forever before the runtime watchdog is enabled.
+#if CHUNI_FAULT_RECOVERY_ENABLE
+    watchdog_enable(8000, true);
+#endif
+    STAGE_ENTER(MAIN_STAGE_SENSOR_INIT);
     button_init();
     slider_init();  // This will call mpr121_init() with barrier mode settings
 #if DEBUG_MPR121
@@ -781,6 +1216,9 @@ int main(void) {
     // I2C1 由 Core1 独占: VL53L0X 初始化与轮询全部在 Core1 上执行
     // (air_init → tof_reader_init → Core1 启动 vl53l0x_init)
     air_init();      // 启动 Core 1 读取任务（含 I2C1 + VL53L0X 初始化）
+    // Both sensor initializations are scheduled, not waited on. Core0 can now
+    // service enumeration while their reset/settling deadlines elapse.
+    tusb_init();
     printf("Ready.\r\n\n");
 
     printf("Commands: STATUS, AIRDEBUG, PERF, DIST, AIR, HELP\r\n\n");
@@ -815,7 +1253,24 @@ int main(void) {
      *
      * ==============================================================================
      */
+    // ===== Core0 硬锁看门狗 =====
+    // 任何主循环 stage 永久卡死 (未知的 while/mutex/sleep 路径, 状态机
+    // 卡住等) 最多 2s 后强制复位; 复位后 crash_prev_stage 给出卡死位置。
+    // 冷启动的 8s 看门狗在此收紧为 2s; 主循环每轮末尾喂狗一次。
+    // pause_on_debug=1: gdb 断点暂停时不误触发。
+#if CHUNI_FAULT_RECOVERY_ENABLE
+    watchdog_enable(2000, 1);
+#endif
+
+    // ===== LED 生命信号: 硬件定时器 IRQ (与主循环完全解耦) =====
+    // 旧实现 LED 在主循环内更新 —— 主循环一死 LED 一起冻结, 失去
+    // 观测价值 (用户实测 "USB 无输入时 LED 也停止变化" 即此缺陷)。
+    // 新实现: 10ms 硬件定时器中断更新 LED, 主循环卡死时由 stage-stall
+    // 判定点亮 (常亮 = 卡死证据)。IRQ 处理器仅做比较 + gpio_put, 微秒级。
+    add_repeating_timer_us(LED_TICK_US, led_timer_cb, NULL, &led_timer);
+
     while (1) {
+        if (bootloader_at && time_us_64() >= bootloader_at) reset_usb_boot(0, 0);
         // 性能统计：记录循环开始时间
         uint64_t loop_start = time_us_64();
 
@@ -825,41 +1280,73 @@ int main(void) {
         uint32_t tud_interval_us = (uint32_t)(loop_start - last_tud_task_us);
         if (last_tud_task_us && tud_interval_us > max_tud_task_interval_us) {
             max_tud_task_interval_us = tud_interval_us;
+            usb_health.max_tud_gap_us = tud_interval_us;
         }
         last_tud_task_us = loop_start;
 
         // ===== TinyUSB Task（最高优先级，必须持续运行）=====
-        tud_task();
+        STAGE_ENTER(MAIN_STAGE_TUD_TASK);
+        service_usb();
         tud_task_count++;
 
-        // ===== CDC任务（低优先级，限制每次处理量）=====
-        cdc_task();
-
         // ===== Slider更新（更高优先级实时输入，非阻塞）=====
-        // MPR121 I2C使用极短timeout，失败立即返回
-        // 正常：<3ms（3个设备，每个<1ms）
-        // 异常：最多3ms（即使所有设备都失败）
+        STAGE_ENTER(MAIN_STAGE_SLIDER);
+        // 推进 MPR121 的一个 I2C 步骤；FIFO/ACK/STOP 等待跨主循环完成。
+        { uint64_t t0 = time_us_64();
         slider_update();
+        uint32_t d = (uint32_t)(time_us_64() - t0); if (d > slider_update_max_us) slider_update_max_us = d; }
 #if DEBUG_MPR121
         mpr121_debug_tick();
 #endif
 
         // ===== AIR更新（高实时性输入，完全独立）=====
+        STAGE_ENTER(MAIN_STAGE_AIR);
         // 仅依赖Core 1 TOF snapshot，不依赖MPR121
+        { uint64_t t0 = time_us_64();
         air_update();
+        uint32_t d = (uint32_t)(time_us_64() - t0); if (d > air_update_max_us) air_update_max_us = d; }
 
         // ===== 物理按钮更新（非阻塞GPIO读取）=====
+        STAGE_ENTER(MAIN_STAGE_BUTTON);
         button_update();
 
         // ===== HID Report生成和发送（必须持续运行）=====
+        STAGE_ENTER(MAIN_STAGE_HID);
+        { uint64_t t0 = time_us_64();
         gen_nkro_report();
         report_usb_hid();
+#if CHUNI_FAULT_RECOVERY_ENABLE
+        usb_hid_watchdog();
+#endif
+        uint32_t d = (uint32_t)(time_us_64() - t0); if (d > hid_task_max_us) hid_task_max_us = d; }
+
+        // ===== CDC任务（低优先级，只接收/解析/入队）=====
+        { uint64_t t0 = time_us_64();
+        STAGE_ENTER(MAIN_STAGE_CDC_TASK);
+        cdc_task();
+        uint32_t d = (uint32_t)(time_us_64() - t0); if (d > cdc_task_max_us) cdc_task_max_us = d; }
+
+        // ===== CDC 命令执行（每轮最多 1 条, 分步推进）=====
+        { uint64_t t0 = time_us_64();
+        STAGE_ENTER(MAIN_STAGE_CMD_STEP);
+        command_step();
+        uint32_t d = (uint32_t)(time_us_64() - t0); if (d > cmd_step_max_us) cmd_step_max_us = d; }
+
 
         // ===== 低优先级后台任务 =====
+        // SAVE 只在空闲窗口 (无按键活动) 执行, 避免游戏进行中随机 USB 短暂停
+        bool keys_idle = (slider_get_state() == 0) && (air_get_bitmap() == 0) &&
+                         gpio_get(BUTTON_ENTER_PIN) && gpio_get(BUTTON_2_PIN);
+        save_set_idle_hint(keys_idle);
+        { uint64_t t0 = time_us_64();
+        STAGE_ENTER(MAIN_STAGE_SAVE);
         save_loop();   // 执行延迟的 Flash 保存（无请求时零开销）
+        uint32_t d = (uint32_t)(time_us_64() - t0); if (d > save_loop_max_us) save_loop_max_us = d; }
 
-        // ===== Core1 ToF 事件输出（非阻塞事件队列 → CDC）=====
-        tof_event_task();
+        // ===== Core1 ToF 事件输出 =====
+        // (printf 已全局禁用: 只发送 HID 报文。事件队列仍由 Core1 写入,
+        //  满后丢弃并计数, 不阻塞 Core1)
+        // tof_event_task();
 
         // 性能统计：计算循环耗时
         uint64_t loop_end = time_us_64();
@@ -873,34 +1360,86 @@ int main(void) {
         main_loop_avg_us = (main_loop_avg_us * 9 + loop_duration) / 10;
 
         // 监控模式：定期输出数据（低优先级）
-        if (monitor_mode) {
-            uint64_t now = time_us_64();
-            uint32_t elapsed_ms = (now - last_monitor_time) / 1000;
+        // (printf 已全局禁用: 只发送 HID 报文, monitor 输出关闭)
+        // if (monitor_mode) {
+        //     uint64_t now = time_us_64();
+        //     uint32_t elapsed_ms = (now - last_monitor_time) / 1000;
+        //
+        //     if (elapsed_ms >= monitor_interval_ms) {
+        //         output_monitor_data();
+        //         last_monitor_time = now;
+        //     }
+        // }
 
-            if (elapsed_ms >= monitor_interval_ms) {
-                output_monitor_data();
-                last_monitor_time = now;
-            }
-        }
-
-        // LED shows activity
-        uint32_t now = to_ms_since_boot(get_absolute_time());
-        gpio_put(LED_PIN, (now / 500) % 2);
+        // ===== 主循环节拍完成标记 + 看门狗喂狗 =====
+        // watchdog_update() 只在完整走完一遍主循环后调用: 任何 stage
+        // 永久卡死都会在 2s 内触发复位, 复位后可读出卡死 stage。
+        // (旧实现的 main_loop_max_us>5000 LED 常亮锁存已移除 —— 那是
+        //  一次性锁存, 第一次 SAVE Flash 擦写 ~400ms 就会永久点亮)
+        loop_completed_count++;
+        last_main_stage = (uint32_t)MAIN_STAGE_LOOP_END;
+        last_stage_enter_us = time_us_32();
+#if CHUNI_FAULT_RECOVERY_ENABLE
+        watchdog_update();
+#endif
     }
 
     return 0;
 }
 
-// HID callbacks
+// HID callbacks + TinyUSB 生命周期回调
 extern "C" {
 uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id,
                                 hid_report_type_t report_type,
                                 uint8_t* buffer, uint16_t reqlen) {
+    // 必须立即返回 —— 不进入 I2C/Flash/printf/等待
+    (void)itf; (void)report_id; (void)report_type; (void)buffer; (void)reqlen;
     return 0;
 }
 
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id,
                            hid_report_type_t report_type,
                            uint8_t const* buffer, uint16_t bufsize) {
+    (void)itf; (void)report_id; (void)report_type; (void)buffer; (void)bufsize;
+}
+
+// ---- TinyUSB 生命周期回调 (由 Core0 的 tud_task() 调用) ----
+// 只更新状态变量/时间戳/计数, 禁止 printf/阻塞/I2C/Flash
+
+void tud_mount_cb(void) {
+    usb_mounted = true;
+    usb_suspended = false;
+    usb_health.mount_count++;
+    usb_health.last_mount_us = time_us_64();
+    // USB 重枚举后强制重发当前 HID 状态: sent 状态无效 + dirty,
+    // 第一次 HID ready 即发送完整当前状态, 用户无需重新按键
+    sent_valid = false;
+    hid_dirty = true;
+    hid_not_ready_since_us = 0;
+}
+
+void tud_umount_cb(void) {
+    usb_mounted = false;
+    usb_suspended = false;
+    usb_health.unmount_count++;
+    usb_health.last_unmount_us = time_us_64();
+    hid_not_ready_since_us = 0;
+}
+
+void tud_suspend_cb(bool remote_wakeup_en) {
+    (void)remote_wakeup_en;
+    usb_suspended = true;
+    usb_health.suspend_count++;
+    usb_health.last_suspend_us = time_us_64();
+    hid_not_ready_since_us = 0;
+}
+
+void tud_resume_cb(void) {
+    usb_suspended = false;
+    usb_health.resume_count++;
+    usb_health.last_resume_us = time_us_64();
+    hid_not_ready_since_us = 0;
+    sent_valid = false;
+    hid_dirty = true;
 }
 }

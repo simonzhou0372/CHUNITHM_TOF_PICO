@@ -92,8 +92,12 @@ enum {
 #define EPNUM_CDC_IN    0x83
 
 static const uint8_t desc_configuration[] = {
+    // bMaxPower = 250 (单位 2mA) = 500mA —— USB 2.0 FS 规范允许的最大声明值。
+    // 实际硬件负载 (5×VL53L0X + 3×MPR121 + LED + RP2040) 峰值接近 200mA 声明值,
+    // 部分主机 (hub / 笔记本电池模式) 按声明值做电源预算, 故声明到上限。
+    // 注意: 该字段是纯信息性声明, 设备实际取电不受它硬件限制。
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN,
-                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 250),
 
     // NKRO Keyboard (Interface 0)
     TUD_HID_DESCRIPTOR(ITF_NUM_NKRO, 3, HID_ITF_PROTOCOL_NONE,

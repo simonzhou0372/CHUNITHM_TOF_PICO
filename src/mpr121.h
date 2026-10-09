@@ -44,82 +44,28 @@
 #define MPR121_DEFAULT_RELEASE_THRESHOLD  18
 #endif
 
-/*
- * ===== MPR121 Non-Blocking I2C Configuration =====
- *
- * 关键参数：
- * - I2C_TIMEOUT_US: 初始化时的timeout（允许较长，因为只在启动时执行）
- * - I2C_UPDATE_TIMEOUT_US: update时的timeout（必须极短，避免阻塞主循环）
- *
- * 设计原则：
- * - MPR121正常时：必须快速完成（每个设备<1ms）
- * - MPR121异常时：必须快速失败（不阻塞AIR和USB HID）
- * - 单次主循环中，所有MPR121操作的总时间必须有界（<3ms）
- */
-#define MPR121_I2C_INIT_TIMEOUT_US    10000   /* 初始化timeout: 10ms */
-#define MPR121_I2C_UPDATE_TIMEOUT_US  500     /* update timeout: 500us (极短) */
+// Deadline for the complete asynchronous transfer (not a busy-wait budget).
+#define MPR121_I2C_UPDATE_TIMEOUT_US  500
+#define MPR121_I2C_RUNTIME_TIMEOUT_US 500
 
-/*
- * ===== MPR121 Debug System =====
- *
- * Set DEBUG_MPR121 to 0 to completely disable all debug code (zero overhead).
- * When enabled, the debug system adds:
- *   - One-shot CONFIG dump after init (thresholds, CONFIG1/2, ECR, filter params)
- *   - TOUCH/RELEASE event logging (only on state transitions)
- *   - Periodic statistics table (filtered/baseline/delta min/max per electrode)
- *
- * Register layout (packed, per MPR121 datasheet):
- *   Filtered: 0x04 + ch*2   (ELE0-ELE11 readable, no overlap)
- *   Baseline: 0x1E + ch*2   (ELE0-ELE5 readable; ELE6+ addresses overlap
- *                             with filter config registers 0x2A-0x35)
- *
- * Delta formula:
- *   delta = (int16_t)(filtered & 0x0FFF) - (int16_t)(baseline & 0x03FF)
- *   Negative delta means filtered < baseline (touch direction).
- *
- * I2C overhead is minimized by:
- *   - Cycling reads: one (dev,ch) pair per N loop iterations (not all at once)
- *   - Event reads: only triggered on state transitions
- *   - Stats print: rate-limited to MPR121_DEBUG_STAT_INTERVAL_MS
- */
-#define DEBUG_MPR121                    0  /* 0 = disable, 1 = enable           */
-#define MPR121_DEBUG_FIRST_ELECTRODE    0   /* first electrode to monitor (0-5)  */
-#define MPR121_DEBUG_LAST_ELECTRODE     5   /* last  electrode to monitor (0-5)  */
-                                            /* NOTE: E6+ baseline is unreadable  */
-                                            /* (overlaps with filter config)     */
-#define MPR121_DEBUG_STAT_INTERVAL_MS 1000  /* statistics table print interval   */
-#define MPR121_DEBUG_SAMPLE_DIVIDER      5  /* read debug data every Nth loop    */
-                                            /* iteration (1 = every loop)        */
+// Diagnostics use cached values; there is no second I2C bus owner.
+#define DEBUG_MPR121 0
 
 namespace Chuni245Tof {
-
-void mpr121_init();
+void mpr121_init(); // schedules cold startup; call update() to advance it
 void mpr121_set_thresholds(uint8_t touch_thr, uint8_t release_thr);
+void mpr121_reset_baseline();
 void mpr121_update();
+void mpr121_task_step(); // command step, invoked by update(); never waits for I/O
+bool mpr121_op_busy();
 uint32_t mpr121_get_touch_state(uint8_t device);
 bool mpr121_is_touched(uint8_t device, uint8_t channel);
-void mpr121_debug_print();  // 打印 Baseline/FilteredData/Delta 调试信息
-void mpr121_reset_baseline();  // 重置所有通道的 Baseline
-uint32_t mpr121_get_error_count(uint8_t device);  // 获取 I2C 错误计数
-
+void mpr121_debug_print(); // cached touch/error counts only
+uint32_t mpr121_get_error_count(uint8_t device);
 #if DEBUG_MPR121
-/*
- * Call once after mpr121_init() completes.
- * Prints the [MPR121 CONFIG] table: CONFIG1, CONFIG2, ECR, DEBOUNCE,
- * filter parameters, and per-electrode touch/release thresholds.
- */
 void mpr121_debug_init();
-
-/*
- * Call every main loop iteration (after slider_update / mpr121_update).
- * Handles event detection, cycling I2C reads, and periodic stats output.
- * Returns immediately if not enough loop iterations have passed (divider).
- */
 void mpr121_debug_tick();
 #endif
-
 } // namespace Chuni245Tof
-
 using namespace Chuni245Tof;
-
 #endif /* MPR121_H */
