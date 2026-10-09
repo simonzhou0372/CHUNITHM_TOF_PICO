@@ -15,7 +15,9 @@
 [![USB](https://img.shields.io/badge/USB-NKRO%20Keyboard-purple)](https://www.usb.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
-A precision Chunithm controller using capacitive touch sensors and TOF distance sensors, designed for RP2040 Pico.
+成品图：
+
+![Product](img/product.png)
 
 ---
 
